@@ -144,11 +144,33 @@ interface LoanWithCustomer {
   customers: { name: string; phone: string | null } | null
 }
 
+interface LoanAgreementSummary {
+  id: string
+  loan_id: string
+  agreement_number: number
+  kind: 'initial' | 'renegotiation' | 'renewal' | 'manual_restructure'
+  status: 'active' | 'superseded' | 'closed' | 'cancelled'
+  total_amount: number
+}
+
 function getCcySymbol(ccy: string): string {
   try {
     return new Intl.NumberFormat('en-GB', { style: 'currency', currency: ccy }).formatToParts(0)
       .find(p => p.type === 'currency')?.value ?? ccy
   } catch { return ccy }
+}
+
+function formatAgreementKindLabel(t: (key: string) => string, kind: LoanAgreementSummary['kind']): string {
+  const translated = t(`loans.agreement_kind_${kind}`)
+  if (translated !== `loans.agreement_kind_${kind}`) return translated
+
+  switch (kind) {
+    case 'initial': return 'Initial'
+    case 'renegotiation': return 'Renegotiation'
+    case 'renewal': return 'Renewal'
+    case 'manual_restructure': return 'Manual restructure'
+    default: return kind
+  }
 }
 
 // ── Lazy HoverCard content for loan rows ──────────────────────────────────────
@@ -315,6 +337,7 @@ export default function LoansPage() {
   const dateFormat = usePreferencesStore(s => s.dateFormat)
 
   const [loans, setLoans] = useState<LoanWithCustomer[]>([])
+  const [activeAgreementsByLoan, setActiveAgreementsByLoan] = useState<Record<string, LoanAgreementSummary>>({})
   const [loading, setLoading] = useState(true)
   const [query, setQuery] = useState('')
   const [activeTab, setActiveTab] = useState<'active' | 'completed'>('active')
@@ -381,18 +404,33 @@ export default function LoansPage() {
 
     if (error) toast.error(t('loans.error_load'))
     else {
-      setLoans(data as unknown as LoanWithCustomer[])
+      const normalizedLoans = data as unknown as LoanWithCustomer[]
+      setLoans(normalizedLoans)
 
       // Compute overdue status for each loan
       const today = new Date().toISOString().split('T')[0]
-      const ids = (data as unknown as LoanWithCustomer[]).map(l => l.id)
+      const ids = normalizedLoans.map(l => l.id)
       if (ids.length > 0) {
-        const { data: overdueRows } = await sb
-          .from('loan_installments')
-          .select('loan_id')
-          .in('loan_id', ids)
-          .or(`status.eq.overdue,and(status.in.(pending,partial),due_date.lt.${today})`)
+        const [{ data: overdueRows }, { data: agreementRows }] = await Promise.all([
+          sb
+            .from('loan_installments')
+            .select('loan_id')
+            .in('loan_id', ids)
+            .or(`status.eq.overdue,and(status.in.(pending,partial),due_date.lt.${today})`),
+          sb
+            .from('loan_agreements')
+            .select('id, loan_id, agreement_number, kind, status, total_amount')
+            .in('loan_id', ids)
+            .eq('status', 'active'),
+        ])
         setOverdueIds(new Set((overdueRows ?? []).map((r: {loan_id: string}) => r.loan_id)))
+        setActiveAgreementsByLoan(
+          Object.fromEntries(
+            (agreementRows ?? []).map((agreement: LoanAgreementSummary) => [agreement.loan_id, agreement]),
+          ),
+        )
+      } else {
+        setActiveAgreementsByLoan({})
       }
     }
     setLoading(false)
@@ -813,6 +851,16 @@ export default function LoansPage() {
               onClick={() => handleOpenDrawer(l)}
               className="rounded-xl border border-border bg-card px-4 py-3.5 cursor-pointer hover:border-primary/30 transition-colors"
             >
+              {activeAgreementsByLoan[l.id] && (
+                <div className="mb-2 flex items-center gap-2">
+                  <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] uppercase font-bold tracking-wide border bg-indigo-500/10 text-indigo-500 border-indigo-500/20">
+                    {(t('loans.agreement_label') || 'Agreement')} #{activeAgreementsByLoan[l.id].agreement_number}
+                  </span>
+                  <span className="text-[11px] text-muted-foreground">
+                    {formatAgreementKindLabel(t, activeAgreementsByLoan[l.id].kind)}
+                  </span>
+                </div>
+              )}
               <div className="flex items-center justify-between gap-3 mb-2">
                 <div className="flex items-center gap-2 min-w-0">
                   <span className={cn(
@@ -841,6 +889,14 @@ export default function LoansPage() {
                 <span>{Number(l.interest_rate).toFixed(2)}% · {l.total_installments}× {t(`loans.freq_${l.frequency || 'monthly'}`)}</span>
                 <span>{formatDateGlobal(l.start_date, dateFormat)}</span>
               </div>
+              {activeAgreementsByLoan[l.id] && (
+                <div className="mt-2 text-[11px] text-muted-foreground">
+                  {(t('loans.active_agreement_label') || 'Active agreement')}:
+                  <span className="ml-1 font-semibold text-foreground">
+                    {getCcySymbol(l.currency || 'USD')}{Number(activeAgreementsByLoan[l.id].total_amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </span>
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -904,7 +960,18 @@ export default function LoansPage() {
                           <MessageCircle className="h-3.5 w-3.5" />
                         </a>
                       )}
+                      {activeAgreementsByLoan[l.id] && (
+                        <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] uppercase font-bold tracking-wide border bg-indigo-500/10 text-indigo-500 border-indigo-500/20">
+                          {(t('loans.agreement_label') || 'Agreement')} #{activeAgreementsByLoan[l.id].agreement_number}
+                        </span>
+                      )}
                     </div>
+                    {activeAgreementsByLoan[l.id] && (
+                      <div className="mt-1 ml-4 text-[11px] text-muted-foreground">
+                        {formatAgreementKindLabel(t, activeAgreementsByLoan[l.id].kind)}
+                        <span className="ml-1">· {getCcySymbol(l.currency || 'USD')}{Number(activeAgreementsByLoan[l.id].total_amount || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                      </div>
+                    )}
                   </td>
                   <td className="px-4 py-3 font-semibold text-foreground">
                     {getCcySymbol(l.currency || 'USD')}{Number(l.principal_amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
