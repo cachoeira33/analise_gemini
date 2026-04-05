@@ -4,6 +4,9 @@ export interface LoanPaymentHistoryEntry {
   date?: string | null
   forgiven_principal?: number | string | null
   forgiven_penalty?: number | string | null
+  principal_component?: number | string | null
+  interest_component?: number | string | null
+  fee_component?: number | string | null
 }
 
 export interface LoanFinancialInstallmentInput {
@@ -65,6 +68,10 @@ export function sumPaymentHistoryPenalty(history?: LoanPaymentHistoryEntry[] | n
 }
 
 export function getEffectivePaidAmount(installment: LoanFinancialInstallmentInput): number {
+  if ((installment.payment_history ?? []).length > 0) {
+    return sumPaymentHistoryAmount(installment.payment_history)
+  }
+
   const historyPaid = sumPaymentHistoryAmount(installment.payment_history)
   const rowPaid = Math.max(0, toSafeNumber(installment.paid_amount))
 
@@ -118,10 +125,28 @@ export function computeLoanFinancialBreakdown({
     penaltiesCollected += penaltyPaid
     penaltiesWaived += penaltyWaived
 
-    const principalPaid = Math.min(principalRemaining, paidAmount)
+    const explicitPrincipal = (installment.payment_history ?? []).reduce(
+      (sum, entry) => sum + Math.max(0, toSafeNumber(entry.principal_component)),
+      0,
+    )
+    const explicitProfit = (installment.payment_history ?? []).reduce(
+      (sum, entry) =>
+        sum
+        + Math.max(0, toSafeNumber(entry.interest_component))
+        + Math.max(0, toSafeNumber(entry.fee_component)),
+      0,
+    )
+
+    const explicitPrincipalApplied = Math.min(principalRemaining, explicitPrincipal)
+    principalRecovered += explicitPrincipalApplied
+    principalRemaining -= explicitPrincipalApplied
+    realizedBaseProfit += explicitProfit
+
+    const implicitCollected = Math.max(0, paidAmount - explicitPrincipal - explicitProfit)
+    const principalPaid = Math.min(principalRemaining, implicitCollected)
     principalRecovered += principalPaid
     principalRemaining -= principalPaid
-    realizedBaseProfit += Math.max(0, paidAmount - principalPaid)
+    realizedBaseProfit += Math.max(0, implicitCollected - principalPaid)
 
     const baseRemaining = Math.max(0, expectedAmount - paidAmount)
     if (isActive) {

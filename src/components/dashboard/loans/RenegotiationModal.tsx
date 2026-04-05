@@ -11,6 +11,7 @@ import { useTenant } from '@/hooks/useTenant'
 import { useAuthUser } from '@/components/providers/AuthUserProvider'
 import { useTranslation } from '@/hooks/useTranslation'
 import { cn } from '@/lib/utils'
+import { getEffectivePaidAmount } from '@/lib/utils/loan-financials'
 
 interface Installment {
   id: string
@@ -19,6 +20,9 @@ interface Installment {
   expected_amount: number
   paid_amount: number
   status: 'pending' | 'partial' | 'paid' | 'overdue' | 'cancelled'
+  payment_history?: Array<{
+    amount?: number | string | null
+  }>
 }
 
 interface LoanConfig {
@@ -57,7 +61,7 @@ function calcSettlement(
 
   for (const inst of insts) {
     if (inst.status === 'paid' || inst.status === 'cancelled') continue
-    const remaining = Math.max(0, Number(inst.expected_amount) - Number(inst.paid_amount))
+    const remaining = Math.max(0, Number(inst.expected_amount) - getEffectivePaidAmount(inst))
     if (remaining === 0) continue
 
     originalRemaining += remaining
