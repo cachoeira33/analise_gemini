@@ -16,6 +16,8 @@ import { computeLoanFinancialBreakdown, getEffectivePaidAmount } from '@/lib/uti
 import { useAuthUser } from '@/components/providers/AuthUserProvider'
 import { useSubscription } from '@/hooks/useSubscription'
 import { RenegotiationModal } from './RenegotiationModal'
+import { InfoTooltip } from '@/components/ui/InfoTooltip'
+import { ensureInitialLoanAgreement, getActiveLoanAgreementId, replaceActiveLoanAgreement } from '@/lib/utils/loan-agreements'
 
 interface PaymentHistoryEntry {
   date: string   // YYYY-MM-DD
@@ -929,12 +931,37 @@ export function InstallmentsDrawer({
     }
 
     // ── Step 3: create new pending installment ───────────────────────────────
+    await ensureInitialLoanAgreement(sb, loanId)
+    const otherActiveInstallments = installments.filter(
+      i => i.id !== inst.id && (i.status === 'pending' || i.status === 'partial' || i.status === 'overdue'),
+    )
+    const agreementId = otherActiveInstallments.length === 0
+      ? await replaceActiveLoanAgreement(sb, {
+        loanId,
+        kind: 'renewal',
+        principalBase: remainingPrincipal,
+        penaltyBase: 0,
+        interestRatePct: interestRate,
+        interestAmount: interestForNewPeriod,
+        totalAmount: newExpectedAmount,
+        totalInstallments: 1,
+        frequency: loanConfig.frequency,
+        firstDueDate: renewDueDate,
+        metadata: {
+          source_installment: inst.installment_number,
+          paid_today: paidToday,
+          previous_penalty_base: penaltyPending,
+        },
+      })
+      : await getActiveLoanAgreementId(sb, loanId)
+
     const lastInst = [...installments]
       .filter(i => i.status !== 'cancelled')
       .sort((a, b) => b.installment_number - a.installment_number)[0]
     const newNumber = (lastInst?.installment_number ?? 0) + 1
 
     const { error: insertErr } = await sb.from('loan_installments').insert({
+      agreement_id: agreementId,
       loan_id: loanId,
       installment_number: newNumber,
       due_date: renewDueDate,
@@ -1181,6 +1208,11 @@ export function InstallmentsDrawer({
     return financialBreakdown.penaltiesPending
   }, [financialBreakdown])
 
+  const tooltipText = (key: string, fallback: string) => {
+    const translated = t(key)
+    return translated === key ? fallback : translated
+  }
+
   return (
     <>
       {/* ── BACKDROP (O "Vidro do Box") ── */}
@@ -1308,7 +1340,10 @@ export function InstallmentsDrawer({
                       {/* ── Admin Actions Toolbar ── */}
                       {canOwnerAct && !isOffDuty && inst.status !== 'cancelled' && (
                         <div className="flex flex-wrap items-center gap-2 px-4 py-2.5 bg-muted/20 border-b border-border/30">
-                          <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider shrink-0">{t('loans.admin_actions') || 'Actions'}:</span>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">{t('loans.admin_actions') || 'Actions'}:</span>
+                            <InfoTooltip text={tooltipText('loans.tooltips.drawer_admin_actions', 'Operational actions to correct installments, move balances, waive debt or renew the agreement.')} />
+                          </div>
 
                           <button
                             onClick={(e) => { e.stopPropagation(); startEdit(inst) }}
@@ -1316,6 +1351,7 @@ export function InstallmentsDrawer({
                           >
                             <Pencil className="w-3 h-3" />
                             {t('loans.edit_installment_btn') || 'Edit installment'}
+                            <InfoTooltip text={tooltipText('loans.tooltips.drawer_edit_installment', 'Adjust due date, expected amount or pending penalty for this installment.')} />
                           </button>
 
                           {isPaid && (
@@ -1325,6 +1361,7 @@ export function InstallmentsDrawer({
                             >
                               <RefreshCw className="w-3 h-3" />
                               {t('loans.reopen_btn') || 'Reopen'}
+                              <InfoTooltip text={tooltipText('loans.tooltips.drawer_reopen_installment', 'Recalculate the installment status from its current payments and reopen it if it should not stay marked as paid.')} />
                             </button>
                           )}
 
@@ -1336,6 +1373,7 @@ export function InstallmentsDrawer({
                               >
                                 <CheckCircle2 className="w-3 h-3" />
                                 {t('loans.waive_close_btn')}
+                                <InfoTooltip text={tooltipText('loans.tooltips.drawer_waive_close', 'Forgive the remaining principal and penalties on this installment without recording new cash received.')} />
                               </button>
 
                               <div className="relative">
@@ -1346,6 +1384,7 @@ export function InstallmentsDrawer({
                                   <RotateCcw className="w-3 h-3" />
                                   {t('loans.rollover_btn')}
                                   <ChevronDown className="h-3 w-3" />
+                                  <InfoTooltip text={tooltipText('loans.tooltips.drawer_rollover', 'Move the unpaid balance to another installment or convert it into a renewal cycle.')} />
                                 </button>
 
                                 {rolloverMenuId === inst.id && (
@@ -1390,6 +1429,9 @@ export function InstallmentsDrawer({
                       {inst.payment_history?.length > 0 && (
                         <div className="px-4 pt-3 pb-2">
                           <p className="text-[10px] text-muted-foreground uppercase tracking-wider font-semibold mb-2">{t('loans.payment_history_label') || 'Payment History'}</p>
+                          <div className="mb-2">
+                            <InfoTooltip text={tooltipText('loans.tooltips.drawer_payment_history', 'Each entry represents a real payment or manual adjustment recorded on this installment. Edit entries to fix historical mistakes safely.')} />
+                          </div>
                           <div className="space-y-1.5">
                             {inst.payment_history.map((ph, idx) => (
                               <div key={idx} className="flex justify-between items-center text-xs px-3 py-2 bg-muted/30 border border-border/40 rounded-lg">

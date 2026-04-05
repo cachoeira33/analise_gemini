@@ -28,6 +28,7 @@ import {
   useSortable, horizontalListSortingStrategy,
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
+import { InfoTooltip } from '@/components/ui/InfoTooltip'
 
 // ── Analytics metric types ─────────────────────────────────────────────────
 type MetricId =
@@ -60,20 +61,22 @@ interface MetricConfig {
   id:     MetricId
   labelKey: string
   fallbackLabel?: string
+  tooltipKey?: string
+  fallbackTooltip?: string
   icon:   React.ElementType
   color:  string
   getValue: (a: LoanAnalytics) => number
 }
 
 const METRIC_CONFIGS: MetricConfig[] = [
-  { id: 'total_lent',          labelKey: 'loans.analytics_total_lent',          icon: DollarSign,   color: 'bg-blue-500',    getValue: a => a.totalLent },
-  { id: 'total_recovered',     labelKey: 'loans.analytics_total_recovered',     fallbackLabel: 'Capital Recovered',  icon: CheckCircle2, color: 'bg-violet-500',  getValue: a => a.totalRecovered },
-  { id: 'total_outstanding',   labelKey: 'loans.analytics_total_outstanding',   fallbackLabel: 'Outstanding Balance', icon: Layers,       color: 'bg-orange-500',  getValue: a => a.totalOutstanding },
-  { id: 'in_arrears',          labelKey: 'loans.analytics_in_arrears',          icon: Clock,        color: 'bg-rose-500',    getValue: a => a.inArrears },
-  { id: 'penalties_pending',   labelKey: 'loans.analytics_penalties_pending',   fallbackLabel: 'Pending Penalties',  icon: AlertTriangle, color: 'bg-red-500', getValue: a => a.penaltiesPending },
-  { id: 'penalties_collected', labelKey: 'loans.analytics_penalties_collected', fallbackLabel: 'Penalties Collected', icon: Receipt,      color: 'bg-amber-500',   getValue: a => a.penaltiesCollected },
-  { id: 'profit_projection',   labelKey: 'loans.analytics_profit_projection',   fallbackLabel: 'Future Profit',       icon: TrendingUp,   color: 'bg-emerald-500', getValue: a => a.profitProjection },
-  { id: 'total_profit',        labelKey: 'loans.analytics_total_profit',        fallbackLabel: 'Total Operation Profit', icon: Sparkles,   color: 'bg-teal-500',    getValue: a => a.totalProfit },
+  { id: 'total_lent', labelKey: 'loans.analytics_total_lent', tooltipKey: 'loans.tooltips.analytics_total_lent', fallbackTooltip: 'Original principal disbursed across the loans in this view.', icon: DollarSign, color: 'bg-blue-500', getValue: a => a.totalLent },
+  { id: 'total_recovered', labelKey: 'loans.analytics_total_recovered', fallbackLabel: 'Capital Recovered', tooltipKey: 'loans.tooltips.analytics_total_recovered', fallbackTooltip: 'Principal already recovered from borrower payments. Penalties are excluded.', icon: CheckCircle2, color: 'bg-violet-500', getValue: a => a.totalRecovered },
+  { id: 'total_outstanding', labelKey: 'loans.analytics_total_outstanding', fallbackLabel: 'Outstanding Balance', tooltipKey: 'loans.tooltips.analytics_total_outstanding', fallbackTooltip: 'Remaining active balance still owed, including pending penalties on active installments.', icon: Layers, color: 'bg-orange-500', getValue: a => a.totalOutstanding },
+  { id: 'in_arrears', labelKey: 'loans.analytics_in_arrears', tooltipKey: 'loans.tooltips.analytics_in_arrears', fallbackTooltip: 'Late balance already past due, including pending penalties on overdue installments.', icon: Clock, color: 'bg-rose-500', getValue: a => a.inArrears },
+  { id: 'penalties_pending', labelKey: 'loans.analytics_penalties_pending', fallbackLabel: 'Pending Penalties', tooltipKey: 'loans.tooltips.analytics_penalties_pending', fallbackTooltip: 'Late fees calculated or carried on active installments that have not been paid or waived yet.', icon: AlertTriangle, color: 'bg-red-500', getValue: a => a.penaltiesPending },
+  { id: 'penalties_collected', labelKey: 'loans.analytics_penalties_collected', fallbackLabel: 'Penalties Collected', tooltipKey: 'loans.tooltips.analytics_penalties_collected', fallbackTooltip: 'Late fees already collected from borrowers.', icon: Receipt, color: 'bg-amber-500', getValue: a => a.penaltiesCollected },
+  { id: 'profit_projection', labelKey: 'loans.analytics_profit_projection', fallbackLabel: 'Future Profit', tooltipKey: 'loans.tooltips.analytics_profit_projection', fallbackTooltip: 'Expected remaining profit if current active agreements are paid as scheduled.', icon: TrendingUp, color: 'bg-emerald-500', getValue: a => a.profitProjection },
+  { id: 'total_profit', labelKey: 'loans.analytics_total_profit', fallbackLabel: 'Total Operation Profit', tooltipKey: 'loans.tooltips.analytics_total_profit', fallbackTooltip: 'Realized profit plus future projected profit for the active operation.', icon: Sparkles, color: 'bg-teal-500', getValue: a => a.totalProfit },
 ]
 
 // ── Sortable metric card ───────────────────────────────────────────────────
@@ -89,6 +92,10 @@ function SortableMetricCard({ cfg, analytics, ccySymbol, loading, t }: {
   const value = analytics ? cfg.getValue(analytics) : 0
   const translatedLabel = t(cfg.labelKey)
   const label = translatedLabel === cfg.labelKey ? (cfg.fallbackLabel ?? cfg.labelKey) : translatedLabel
+  const translatedTooltip = cfg.tooltipKey ? t(cfg.tooltipKey) : ''
+  const tooltip = cfg.tooltipKey
+    ? (translatedTooltip === cfg.tooltipKey ? (cfg.fallbackTooltip ?? '') : translatedTooltip)
+    : ''
 
   return (
     <div
@@ -115,7 +122,10 @@ function SortableMetricCard({ cfg, analytics, ccySymbol, loading, t }: {
             {ccySymbol}{value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
           </p>
         )}
-        <p className="text-xs text-muted-foreground mt-0.5 leading-tight">{label}</p>
+        <div className="flex items-start gap-1 mt-0.5">
+          <p className="text-xs text-muted-foreground leading-tight">{label}</p>
+          {tooltip && <InfoTooltip text={tooltip} />}
+        </div>
       </div>
     </div>
   )

@@ -9,6 +9,7 @@ import { useTranslation } from '@/hooks/useTranslation'
 import { parseWhatsAppMessage } from '@/lib/whatsapp/dispatcher'
 import { cn } from '@/lib/utils'
 import { useAuthUser } from '@/components/providers/AuthUserProvider'
+import { ensureInitialLoanAgreement, replaceActiveLoanAgreement } from '@/lib/utils/loan-agreements'
 
 const DEFAULT_TEMPLATE = 'Hello {{customer_name}}, your loan of {{loan_amount}} has been registered!'
 
@@ -51,6 +52,11 @@ function Tooltip({ text }: { text: string }) {
       </span>
     </span>
   )
+}
+
+function withFallback(t: (key: string, params?: Record<string, string | number>) => string, key: string, fallback: string) {
+  const translated = t(key)
+  return translated === key ? fallback : translated
 }
 
 // ── Schedule Date Calculator (mirrors RPC INTERVAL logic exactly) ─────────────
@@ -279,6 +285,8 @@ export function CreateLoanModal({
       const { error: rpcErr } = await sb.rpc('generate_loan_installments', { p_loan_id: loan.id })
       if (rpcErr) throw rpcErr
 
+      await ensureInitialLoanAgreement(sb, loan.id)
+
       toast.success(t('loans.created'))
 
       // Best-effort: sync loan disbursement as an expense transaction
@@ -379,6 +387,30 @@ export function CreateLoanModal({
       const { error: rpcErr } = await sb.rpc('generate_loan_installments', { p_loan_id: editLoanId })
       if (rpcErr) throw rpcErr
 
+      const agreementId = await replaceActiveLoanAgreement(sb, {
+        loanId: editLoanId,
+        kind: 'manual_restructure',
+        principalBase: p,
+        penaltyBase: 0,
+        interestRatePct: (parseFloat(form.interest_rate) || 0),
+        interestAmount: Math.max(0, simTotal - p),
+        totalAmount: simTotal,
+        totalInstallments: n,
+        frequency: form.frequency,
+        firstDueDate: schedDates[0]?.toISOString().split('T')[0] ?? form.start_date,
+        metadata: {
+          source: 'loan_edit',
+          edit_mode: true,
+          interest_type: form.interest_type,
+        },
+      })
+
+      await sb.from('loan_installments')
+        .update({ agreement_id: agreementId })
+        .eq('loan_id', editLoanId)
+        .eq('status', 'pending')
+        .is('agreement_id', null)
+
       if (user && businessId) {
         await sb.from('audit_logs').insert({
           business_id: businessId, user_id: user.id,
@@ -451,12 +483,18 @@ export function CreateLoanModal({
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-sm font-medium text-foreground mb-1.5">{t('loans.principal_label')} *</label>
+              <div className="mb-1.5">
+                <Tooltip text={withFallback(t, 'loans.tooltips.create_principal', 'Amount of capital you are lending before interest, penalties or renewals.')} />
+              </div>
               <input type="number" step="0.01" min="0" required value={form.principal_amount}
                 onChange={e => setForm(f => ({ ...f, principal_amount: e.target.value }))}
                 placeholder={t('loans.principal_placeholder')} className={inputCls} />
             </div>
             <div>
               <label className="block text-sm font-medium text-foreground mb-1.5">{t('loans.rate_label')} *</label>
+              <div className="mb-1.5">
+                <Tooltip text={withFallback(t, 'loans.tooltips.create_interest_rate', 'Interest rate applied to the loan schedule. In simple mode it applies once to the whole loan. In compound mode it follows the PMT formula.')} />
+              </div>
               <input type="number" step="0.01" min="0" required value={form.interest_rate}
                 onChange={e => setForm(f => ({ ...f, interest_rate: e.target.value }))}
                 placeholder={t('loans.rate_placeholder')} className={inputCls} />
@@ -467,6 +505,9 @@ export function CreateLoanModal({
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-sm font-medium text-foreground mb-1.5">{t('loans.duration_label')} *</label>
+              <div className="mb-1.5">
+                <Tooltip text={withFallback(t, 'loans.tooltips.create_installments', 'Number of scheduled installments in the original agreement.')} />
+              </div>
               <input type="number" step="1" min="1" required
                 value={form.frequency === 'custom' ? '1' : form.total_installments}
                 disabled={form.frequency === 'custom'}
@@ -493,6 +534,9 @@ export function CreateLoanModal({
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-sm font-medium text-foreground mb-1.5">{t('loans.frequency_label')} *</label>
+              <div className="mb-1.5">
+                <Tooltip text={withFallback(t, 'loans.tooltips.create_frequency', 'How often each installment is due. This defines the spacing between due dates in the original contract.')} />
+              </div>
               <select value={form.frequency}
                 onChange={e => setForm(f => ({ ...f, frequency: e.target.value as typeof form.frequency, custom_due_date: '' }))}
                 className={inputCls}>
@@ -508,6 +552,9 @@ export function CreateLoanModal({
                 <CalendarDays className="h-3.5 w-3.5 text-muted-foreground/60" />
                 {t('loans.start_date_label')} *
               </label>
+              <div className="mb-1.5">
+                <Tooltip text={withFallback(t, 'loans.tooltips.create_start_date', 'Reference date used to generate the first due date and the rest of the installment schedule.')} />
+              </div>
               <input type="date" required value={form.start_date}
                 onChange={e => setForm(f => ({ ...f, start_date: e.target.value }))}
                 className={inputCls} />
