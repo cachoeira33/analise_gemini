@@ -15,6 +15,7 @@
       "drawer_waive_close": "Forgive the remaining principal and penalties on this installment without recording new cash received.",
       "drawer_rollover": "Move the unpaid balance to another installment or convert it into a renewal cycle.",
       "drawer_payment_history": "Each entry represents a real payment or manual adjustment recorded on this installment. Edit entries to fix historical mistakes safely.",
+      "drawer_agreement_history": "Shows the original agreement plus renewals and restructures. The active agreement is the one that should drive the current outstanding balance.",
       "create_principal": "Amount of capital you are lending before interest, penalties or renewals.",
       "create_interest_rate": "Interest rate applied to the loan schedule. In simple mode it applies once to the whole loan. In compound mode it follows the PMT formula.",
       "create_installments": "Number of scheduled installments in the original agreement.",

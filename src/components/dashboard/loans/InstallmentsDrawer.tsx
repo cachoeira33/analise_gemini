@@ -38,6 +38,7 @@ interface PaymentHistoryEntry {
 
 interface Installment {
   id: string
+  agreement_id?: string | null
   installment_number: number
   due_date: string
   expected_amount: number
@@ -58,6 +59,24 @@ interface LoanConfig {
   /** ISO 4217 currency code for this loan (GBP, USD, EUR, …) */
   currency: string
   frequency: string
+}
+
+interface LoanAgreement {
+  id: string
+  agreement_number: number
+  kind: 'initial' | 'renegotiation' | 'renewal' | 'manual_restructure'
+  status: 'active' | 'superseded' | 'closed' | 'cancelled'
+  principal_base: number
+  penalty_base: number
+  interest_rate_pct: number
+  interest_amount: number
+  total_amount: number
+  total_installments: number
+  frequency: string | null
+  first_due_date: string | null
+  created_at: string
+  superseded_at?: string | null
+  metadata?: Record<string, unknown> | null
 }
 
 interface SettlementRow {
@@ -227,6 +246,7 @@ export function InstallmentsDrawer({
 
   const [customerLang, setCustomerLang] = useState<string>('en')
   const [installments, setInstallments] = useState<Installment[]>([])
+  const [agreements, setAgreements] = useState<LoanAgreement[]>([])
   const [loading, setLoading] = useState(true)
   const [loanConfig, setLoanConfig] = useState<LoanConfig>({ late_fee_fixed: 0, late_fee_daily_pct: 0, late_fee_flat_daily: 0, is_interest_frozen: false, currency: '', frequency: 'monthly' })
   // Customer ID for linking payments as proper ledger entries
@@ -289,6 +309,7 @@ export function InstallmentsDrawer({
   const [renewPaidToday, setRenewPaidToday] = useState('')
   const [renewDueDate, setRenewDueDate] = useState('')
   const [renewInterestRate, setRenewInterestRate] = useState('0')
+  const [renewMode, setRenewMode] = useState<'capitalize_balance' | 'interest_only'>('capitalize_balance')
   const [savingRenewal, setSavingRenewal] = useState(false)
 
   // ── Principal amount (from loans row) ────────────────────────────────────
@@ -332,11 +353,16 @@ export function InstallmentsDrawer({
 
   const fetchInstallments = async () => {
     setLoading(true)
-    const { data, error } = await sb
-      .from('loan_installments').select('*').eq('loan_id', loanId)
-      .order('installment_number', { ascending: true })
+    const [{ data, error }, { data: agreementsData, error: agreementsError }] = await Promise.all([
+      sb.from('loan_installments').select('*').eq('loan_id', loanId)
+        .order('installment_number', { ascending: true }),
+      sb.from('loan_agreements').select('*').eq('loan_id', loanId)
+        .order('agreement_number', { ascending: false }),
+    ])
     if (error) toast.error(error.message)
     else setInstallments((data || []) as Installment[])
+    if (agreementsError) toast.error(agreementsError.message)
+    else setAgreements((agreementsData || []) as LoanAgreement[])
     setLoading(false)
   }
 
@@ -885,17 +911,20 @@ export function InstallmentsDrawer({
     const remaining = Math.max(0, Number(inst.expected_amount) - effectivePaid)
     const penaltyPending = Number(inst.penalty_pending) || 0
     const outstandingBalance = remaining + penaltyPending
+    const carriedPenaltyBase = penaltyPending
 
     if (paidToday > outstandingBalance) {
       return toast.error('Amount paid today cannot exceed outstanding balance')
     }
 
     // New principal = what is still owed after today's payment
-    const remainingPrincipal = Math.max(0, outstandingBalance - paidToday)
+    const remainingPrincipal = renewMode === 'interest_only'
+      ? Math.max(0, financialBreakdown.principalRemaining)
+      : Math.max(0, outstandingBalance - paidToday)
     // Interest for new period = flat rate on remaining principal (0% → no interest charge)
     const interestForNewPeriod = remainingPrincipal * (interestRate / 100)
     // New expected = principal + interest
-    const newExpectedAmount = remainingPrincipal + interestForNewPeriod
+    const newExpectedAmount = remainingPrincipal + carriedPenaltyBase + interestForNewPeriod
 
     setSavingRenewal(true)
 
@@ -940,7 +969,7 @@ export function InstallmentsDrawer({
         loanId,
         kind: 'renewal',
         principalBase: remainingPrincipal,
-        penaltyBase: 0,
+        penaltyBase: carriedPenaltyBase,
         interestRatePct: interestRate,
         interestAmount: interestForNewPeriod,
         totalAmount: newExpectedAmount,
@@ -951,6 +980,7 @@ export function InstallmentsDrawer({
           source_installment: inst.installment_number,
           paid_today: paidToday,
           previous_penalty_base: penaltyPending,
+          renew_mode: renewMode,
         },
       })
       : await getActiveLoanAgreementId(sb, loanId)
@@ -1208,6 +1238,28 @@ export function InstallmentsDrawer({
     return financialBreakdown.penaltiesPending
   }, [financialBreakdown])
 
+  const activeAgreement = useMemo(
+    () => agreements.find(agreement => agreement.status === 'active') ?? null,
+    [agreements],
+  )
+  const agreementsById = useMemo(
+    () => new Map(agreements.map(agreement => [agreement.id, agreement])),
+    [agreements],
+  )
+
+  const formatAgreementKind = (kind: LoanAgreement['kind']) => {
+    const translated = t(`loans.agreement_kind_${kind}`)
+    if (translated !== `loans.agreement_kind_${kind}`) return translated
+
+    switch (kind) {
+      case 'initial': return 'Initial'
+      case 'renegotiation': return 'Renegotiation'
+      case 'renewal': return 'Renewal'
+      case 'manual_restructure': return 'Manual restructure'
+      default: return kind
+    }
+  }
+
   const tooltipText = (key: string, fallback: string) => {
     const translated = t(key)
     return translated === key ? fallback : translated
@@ -1280,6 +1332,62 @@ export function InstallmentsDrawer({
               <p className="font-bold text-amber-400 text-sm">{ccySymbol}{fmt(profitProjection)}</p>
             </div>
           </div>
+
+          {agreements.length > 0 && (
+            <div className="mt-4 rounded-xl border border-border bg-background/80 p-3">
+              <div className="flex items-center gap-2 mb-2">
+                <p className="text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">
+                  {t('loans.agreement_history_title') || 'Agreement history'}
+                </p>
+                <InfoTooltip text={tooltipText('loans.tooltips.drawer_agreement_history', 'Shows the original agreement plus renewals and restructures. The active agreement is the one that should drive the current outstanding balance.')} />
+              </div>
+
+              {activeAgreement && (
+                <div className="mb-3 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-semibold text-foreground">
+                        {(t('loans.active_agreement_label') || 'Active agreement')} #{activeAgreement.agreement_number}
+                      </p>
+                      <p className="text-[11px] text-muted-foreground">
+                        {formatAgreementKind(activeAgreement.kind)} · {ccySymbol}{fmt(Number(activeAgreement.total_amount) || 0)}
+                      </p>
+                    </div>
+                    <span className="px-2 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider bg-emerald-500/15 text-emerald-500">
+                      {t('loans.status_active') || 'active'}
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
+                {agreements.map(agreement => (
+                  <div key={agreement.id} className="flex items-start justify-between gap-3 rounded-lg border border-border/60 px-3 py-2">
+                    <div>
+                      <p className="text-xs font-semibold text-foreground">
+                        #{agreement.agreement_number} · {formatAgreementKind(agreement.kind)}
+                      </p>
+                      <p className="text-[11px] text-muted-foreground">
+                        {ccySymbol}{fmt(Number(agreement.total_amount) || 0)}
+                        {agreement.first_due_date ? ` · ${formatDateGlobal(agreement.first_due_date, dateFormat)}` : ''}
+                      </p>
+                    </div>
+                    <span className={cn(
+                      'px-2 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider',
+                      agreement.status === 'active' && 'bg-emerald-500/15 text-emerald-500',
+                      agreement.status === 'superseded' && 'bg-slate-500/15 text-slate-400',
+                      agreement.status === 'closed' && 'bg-blue-500/15 text-blue-400',
+                      agreement.status === 'cancelled' && 'bg-rose-500/15 text-rose-400',
+                    )}>
+                      {t(`loans.agreement_status_${agreement.status}`) === `loans.agreement_status_${agreement.status}`
+                        ? agreement.status
+                        : t(`loans.agreement_status_${agreement.status}`)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
 
         {/* ── INSTALLMENT LIST ── */}
@@ -1291,13 +1399,28 @@ export function InstallmentsDrawer({
           ) : installments.length === 0 ? (
             <div className="text-center py-10 text-sm text-muted-foreground">{t('loans.no_installments') || 'No installments found.'}</div>
           ) : (
-            installments.map((inst) => {
+            installments.map((inst, idx) => {
               const isPaid = inst.status === 'paid'
               const isExpanded = expandedIds.has(inst.id)
               const isReceiving = receivingId === inst.id
+              const agreement = inst.agreement_id ? agreementsById.get(inst.agreement_id) : null
+              const previousInst = installments[idx - 1]
+              const previousAgreementId = previousInst?.agreement_id ?? null
+              const showAgreementHeader = agreement && agreement.id !== previousAgreementId
 
               return (
-                <div key={inst.id} className={cn(
+                <div key={inst.id}>
+                  {showAgreementHeader && (
+                    <div className="mb-2 mt-4 first:mt-0 flex items-center gap-2">
+                      <span className="px-2 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider bg-indigo-500/15 text-indigo-400">
+                        {(t('loans.agreement_label') || 'Agreement')} #{agreement.agreement_number}
+                      </span>
+                      <span className="text-[11px] text-muted-foreground">
+                        {formatAgreementKind(agreement.kind)}
+                      </span>
+                    </div>
+                  )}
+                <div className={cn(
                   'border rounded-xl transition-all overflow-hidden shadow-sm',
                   isPaid ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-border bg-card hover:border-slate-500/40',
                 )}>
@@ -1406,6 +1529,7 @@ export function InstallmentsDrawer({
                                         e.stopPropagation()
                                         setRolloverMenuId(null)
                                         setRenewingInst(inst)
+                                        setRenewMode('capitalize_balance')
                                         setRenewPaidToday('')
                                         setRenewInterestRate(String(loanConfig.late_fee_daily_pct || 0))
                                         const nextMonth = new Date()
@@ -1591,6 +1715,7 @@ export function InstallmentsDrawer({
                                 e.stopPropagation()
                                 setRolloverMenuId(null)
                                 setRenewingInst(inst)
+                                setRenewMode('capitalize_balance')
                                 setRenewPaidToday('')
                                 setRenewInterestRate(String(loanConfig.late_fee_daily_pct || 0))
                                 const nextMonth = new Date()
@@ -1749,6 +1874,7 @@ export function InstallmentsDrawer({
                   )}
 
                 </div>
+                </div>
               )
             })
           )}
@@ -1775,8 +1901,11 @@ export function InstallmentsDrawer({
         const remaining = Math.max(0, Number(inst.expected_amount) - getEffectivePaidAmount(inst))
         const penaltyPending = Number(inst.penalty_pending) || 0
         const outstanding = remaining + penaltyPending
-        const remainingPrincipal = Math.max(0, outstanding - paidToday)
-        const newExpected = remainingPrincipal + remainingPrincipal * (interestRate / 100)
+        const remainingPrincipal = renewMode === 'interest_only'
+          ? Math.max(0, financialBreakdown.principalRemaining)
+          : Math.max(0, outstanding - paidToday)
+        const carriedPenaltyBase = penaltyPending
+        const newExpected = remainingPrincipal + carriedPenaltyBase + remainingPrincipal * (interestRate / 100)
         const isValid = !!renewDueDate && paidToday <= outstanding
 
         return (
@@ -1840,6 +1969,38 @@ export function InstallmentsDrawer({
                   )}
                 </div>
 
+                <div>
+                  <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">
+                    {t('loans.renew_mode_label') || 'Renewal mode'}
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      onClick={() => setRenewMode('capitalize_balance')}
+                      className={cn(
+                        'rounded-lg border px-3 py-2 text-left text-xs transition-colors',
+                        renewMode === 'capitalize_balance'
+                          ? 'border-primary bg-primary/10 text-foreground'
+                          : 'border-border bg-muted/20 text-muted-foreground hover:bg-muted/40',
+                      )}
+                    >
+                      <span className="block font-semibold">{t('loans.renew_mode_capitalize') || 'Capitalize balance'}</span>
+                      <span className="block mt-1 text-[11px]">{t('loans.renew_mode_capitalize_desc') || 'Today’s payment reduces the balance before the new cycle is created.'}</span>
+                    </button>
+                    <button
+                      onClick={() => setRenewMode('interest_only')}
+                      className={cn(
+                        'rounded-lg border px-3 py-2 text-left text-xs transition-colors',
+                        renewMode === 'interest_only'
+                          ? 'border-primary bg-primary/10 text-foreground'
+                          : 'border-border bg-muted/20 text-muted-foreground hover:bg-muted/40',
+                      )}
+                    >
+                      <span className="block font-semibold">{t('loans.renew_mode_interest_only') || 'Interest only'}</span>
+                      <span className="block mt-1 text-[11px]">{t('loans.renew_mode_interest_only_desc') || 'Keep the principal rolling and treat today’s payment as renewal income.'}</span>
+                    </button>
+                  </div>
+                </div>
+
                 {/* Input 2: New Due Date */}
                 <div>
                   <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">
@@ -1879,6 +2040,12 @@ export function InstallmentsDrawer({
                       <span>{t('loans.renew_remaining_principal') || 'Remaining Principal'}</span>
                       <span className="font-semibold text-foreground">{ccySymbol}{fmt(remainingPrincipal)}</span>
                     </div>
+                    {carriedPenaltyBase > 0 && (
+                      <div className="flex justify-between text-muted-foreground">
+                        <span>{t('loans.renew_carried_penalty') || 'Carried penalty'}</span>
+                        <span className="font-semibold text-rose-400">{ccySymbol}{fmt(carriedPenaltyBase)}</span>
+                      </div>
+                    )}
                     {interestRate > 0 && (
                       <div className="flex justify-between text-muted-foreground">
                         <span>{t('loans.renew_interest_charge') || 'Interest'} ({interestRate}%)</span>
