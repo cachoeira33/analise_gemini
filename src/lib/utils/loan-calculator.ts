@@ -54,7 +54,7 @@ export interface PenaltyRules {
   /**
    * Flat GBP amount charged per calendar day overdue.
    * Maps to loans.late_fee_flat_daily.
-   * Default: 15 (£15/day per product spec).
+   * Set to 0 to disable.
    */
   flat_daily: number
   /**
@@ -282,7 +282,7 @@ export function calculateLoanStatus(
 
 /**
  * Build a PenaltyRules object from a loans DB row.
- * Provides the product-spec default of £15/day flat when all fields are 0.
+ * Uses only the explicit values saved on the loan.
  */
 export function rulesFromLoan(loan: {
   late_fee_flat_daily: number
@@ -290,7 +290,7 @@ export function rulesFromLoan(loan: {
   late_fee_fixed: number
 }): PenaltyRules {
   return {
-    flat_daily:  loan.late_fee_flat_daily > 0 ? loan.late_fee_flat_daily : 15,
+    flat_daily:  loan.late_fee_flat_daily > 0 ? loan.late_fee_flat_daily : 0,
     daily_pct:   loan.late_fee_daily_pct,
     fixed_once:  loan.late_fee_fixed,
   }

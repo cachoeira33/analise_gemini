@@ -12,6 +12,7 @@ import { useTranslation } from '@/hooks/useTranslation'
 import { cn } from '@/lib/utils'
 import { usePreferencesStore } from '@/lib/stores/usePreferencesStore'
 import { formatDateGlobal } from '@/lib/formatDate'
+import { computeLoanFinancialBreakdown, getEffectivePaidAmount } from '@/lib/utils/loan-financials'
 import { useAuthUser } from '@/components/providers/AuthUserProvider'
 import { useSubscription } from '@/hooks/useSubscription'
 import { RenegotiationModal } from './RenegotiationModal'
@@ -94,7 +95,7 @@ function computePenaltyAtDate(inst: Installment, config: LoanConfig, payDateISO:
   if (isNaN(payRef.getTime()) || isNaN(dueRef.getTime())) return 0
   const daysLate = Math.max(0, Math.floor((payRef.getTime() - dueRef.getTime()) / 86_400_000))
   if (daysLate === 0) return 0
-  const remaining = Math.max(0, Number(inst.expected_amount) - Number(inst.paid_amount))
+  const remaining = Math.max(0, Number(inst.expected_amount) - getEffectivePaidAmount(inst))
   // Force numeric coercion — values may arrive as strings from Supabase
   const fixedFee = Number(config.late_fee_fixed) || 0
   const flatDaily = Number(config.late_fee_flat_daily) || 0
@@ -128,7 +129,7 @@ function calcSettlement(insts: Installment[], config: LoanConfig, asOfDate?: Dat
 
   for (const inst of insts) {
     if (inst.status === 'paid' || inst.status === 'cancelled') continue
-    const remaining = Math.max(0, Number(inst.expected_amount) - Number(inst.paid_amount))
+    const remaining = Math.max(0, Number(inst.expected_amount) - getEffectivePaidAmount(inst))
     if (remaining === 0) continue
 
     originalRemaining += remaining
@@ -1000,40 +1001,34 @@ export function InstallmentsDrawer({
   // ── Totals (exclude cancelled) ────────────────────────────────────────────
   const activeInsts = installments.filter((i: Installment) => i.status !== 'cancelled')
   const totalExpected = activeInsts.reduce((acc: number, c: Installment) => acc + Number(c.expected_amount), 0)
-  const totalPaid    = activeInsts.reduce((acc: number, c: Installment) => acc + Number(c.paid_amount), 0)
+  const totalPaid = activeInsts.reduce((acc: number, c: Installment) => acc + getEffectivePaidAmount(c), 0)
   const totalRemaining = totalExpected - totalPaid
+  const todayStr = todayISO()
+  const financialBreakdown = useMemo(
+    () => computeLoanFinancialBreakdown({
+      principalAmount: loanPrincipal ?? 0,
+      installments,
+      today: todayStr,
+    }),
+    [installments, loanPrincipal, todayStr],
+  )
 
   // ── Total Recovered — absolute sum of every cash entry in payment_history ─
   // Includes principal payments, interest payments, and penalty payments.
-  const totalRecovered = installments.reduce((acc: number, inst: Installment) => {
-    return acc + (inst.payment_history ?? []).reduce(
-      (s: number, h: PaymentHistoryEntry) => s + (Number(h.amount) || 0) + (Number(h.penalty_paid) || 0),
-      0,
-    )
-  }, 0)
+  const totalRecovered = financialBreakdown.principalRecovered
 
   // ── Saldo Devedor Total — everything the client still owes ────────────────
-  const totalOutstanding = installments
-    .filter((i: Installment) => i.status === 'pending' || i.status === 'partial' || i.status === 'overdue')
-    .reduce((acc: number, i: Installment) =>
-      acc + Math.max(0, Number(i.expected_amount) - Number(i.paid_amount)) + (Number(i.penalty_pending) || 0), 0)
+  const totalOutstanding = financialBreakdown.totalOutstanding
 
   // ── Total em Atraso — unpaid balance on installments past due date ─────────
-  const todayStr = todayISO()
-  const totalInArrears = installments
-    .filter((i: Installment) => i.status !== 'cancelled' && i.status !== 'paid' && i.due_date < todayStr)
-    .reduce((acc: number, i: Installment) =>
-      acc + Math.max(0, Number(i.expected_amount) - Number(i.paid_amount)) + (Number(i.penalty_pending) || 0), 0)
+  const totalInArrears = financialBreakdown.inArrears
 
   // ── Projeção de Lucro — total interest income expected ────────────────────
   // (Total Expected across all active installments) − (Original Principal Lent)
-  const profitProjection = Math.max(0, totalExpected - (loanPrincipal ?? 0))
+  const profitProjection = financialBreakdown.futureProfit
 
   const settlement: Settlement = useMemo(() => calcSettlement(installments, loanConfig), [installments, loanConfig])
-  const totalPenaltiesPaid = useMemo(
-    () => installments.reduce((s, i) => s + Number(i.penalty_paid || 0), 0),
-    [installments]
-  )
+  const totalPenaltiesPaid = useMemo(() => financialBreakdown.penaltiesCollected, [financialBreakdown])
   const canOwnerAct = memberRole === 'owner' || memberRole === 'manager'
 
   // Derive the currency symbol strictly from the loan's own ISO currency code
@@ -1049,8 +1044,8 @@ export function InstallmentsDrawer({
   }, [loanConfig.currency])
 
   const totalPenaltyPending = useMemo(() => {
-    return installments.reduce((acc, inst) => acc + (Number(inst.penalty_pending) || 0), 0)
-  }, [installments])
+    return financialBreakdown.penaltiesPending
+  }, [financialBreakdown])
 
   return (
     <>

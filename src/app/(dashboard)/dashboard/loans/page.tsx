@@ -12,6 +12,7 @@ import { useSubscription } from '@/hooks/useSubscription'
 import { FeatureGate } from '@/components/billing/FeatureGate'
 import { usePreferencesStore } from '@/lib/stores/usePreferencesStore'
 import { formatDateGlobal } from '@/lib/formatDate'
+import { computeLoanFinancialBreakdown, type LoanFinancialInstallmentInput } from '@/lib/utils/loan-financials'
 import { CreateLoanModal } from '@/components/dashboard/loans/CreateLoanModal'
 import { InstallmentsDrawer } from '@/components/dashboard/loans/InstallmentsDrawer'
 import { ImportLoansModal } from '@/components/dashboard/loans/ImportLoansModal'
@@ -29,12 +30,21 @@ import {
 import { CSS } from '@dnd-kit/utilities'
 
 // ── Analytics metric types ─────────────────────────────────────────────────
-type MetricId = 'total_lent' | 'profit_projection' | 'penalties_collected' | 'in_arrears' | 'total_recovered' | 'total_profit' | 'total_outstanding'
+type MetricId =
+  | 'total_lent'
+  | 'total_recovered'
+  | 'total_outstanding'
+  | 'in_arrears'
+  | 'penalties_pending'
+  | 'penalties_collected'
+  | 'profit_projection'
+  | 'total_profit'
 
 interface LoanAnalytics {
   totalLent:           number
   profitProjection:    number
   penaltiesCollected:  number
+  penaltiesPending:    number
   inArrears:           number
   totalRecovered:      number
   totalProfit:         number
@@ -43,12 +53,13 @@ interface LoanAnalytics {
 
 const METRIC_STORAGE_KEY   = 'loans_metric_card_order'
 const DEFAULT_METRIC_ORDER: MetricId[] = [
-  'total_lent', 'profit_projection', 'total_profit', 'penalties_collected', 'in_arrears', 'total_recovered', 'total_outstanding',
+  'total_lent', 'total_recovered', 'total_outstanding', 'in_arrears', 'penalties_pending', 'penalties_collected', 'profit_projection', 'total_profit',
 ]
 
 interface MetricConfig {
   id:     MetricId
   labelKey: string
+  fallbackLabel?: string
   icon:   React.ElementType
   color:  string
   getValue: (a: LoanAnalytics) => number
@@ -56,12 +67,13 @@ interface MetricConfig {
 
 const METRIC_CONFIGS: MetricConfig[] = [
   { id: 'total_lent',          labelKey: 'loans.analytics_total_lent',          icon: DollarSign,   color: 'bg-blue-500',    getValue: a => a.totalLent },
-  { id: 'profit_projection',   labelKey: 'loans.analytics_profit_projection',   icon: TrendingUp,   color: 'bg-emerald-500', getValue: a => a.profitProjection },
-  { id: 'total_profit',        labelKey: 'loans.analytics_total_profit',        icon: Sparkles,     color: 'bg-teal-500',    getValue: a => a.totalProfit },
-  { id: 'penalties_collected', labelKey: 'loans.analytics_penalties_collected', icon: Receipt,      color: 'bg-amber-500',   getValue: a => a.penaltiesCollected },
+  { id: 'total_recovered',     labelKey: 'loans.analytics_total_recovered',     fallbackLabel: 'Capital Recovered',  icon: CheckCircle2, color: 'bg-violet-500',  getValue: a => a.totalRecovered },
+  { id: 'total_outstanding',   labelKey: 'loans.analytics_total_outstanding',   fallbackLabel: 'Outstanding Balance', icon: Layers,       color: 'bg-orange-500',  getValue: a => a.totalOutstanding },
   { id: 'in_arrears',          labelKey: 'loans.analytics_in_arrears',          icon: Clock,        color: 'bg-rose-500',    getValue: a => a.inArrears },
-  { id: 'total_recovered',     labelKey: 'loans.analytics_total_recovered',     icon: CheckCircle2, color: 'bg-violet-500',  getValue: a => a.totalRecovered },
-  { id: 'total_outstanding',   labelKey: 'loans.analytics_total_outstanding',   icon: Layers,       color: 'bg-orange-500',  getValue: a => a.totalOutstanding },
+  { id: 'penalties_pending',   labelKey: 'loans.analytics_penalties_pending',   fallbackLabel: 'Pending Penalties',  icon: AlertTriangle, color: 'bg-red-500', getValue: a => a.penaltiesPending },
+  { id: 'penalties_collected', labelKey: 'loans.analytics_penalties_collected', fallbackLabel: 'Penalties Collected', icon: Receipt,      color: 'bg-amber-500',   getValue: a => a.penaltiesCollected },
+  { id: 'profit_projection',   labelKey: 'loans.analytics_profit_projection',   fallbackLabel: 'Future Profit',       icon: TrendingUp,   color: 'bg-emerald-500', getValue: a => a.profitProjection },
+  { id: 'total_profit',        labelKey: 'loans.analytics_total_profit',        fallbackLabel: 'Total Operation Profit', icon: Sparkles,   color: 'bg-teal-500',    getValue: a => a.totalProfit },
 ]
 
 // ── Sortable metric card ───────────────────────────────────────────────────
@@ -75,6 +87,8 @@ function SortableMetricCard({ cfg, analytics, ccySymbol, loading, t }: {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: cfg.id })
   const Icon = cfg.icon
   const value = analytics ? cfg.getValue(analytics) : 0
+  const translatedLabel = t(cfg.labelKey)
+  const label = translatedLabel === cfg.labelKey ? (cfg.fallbackLabel ?? cfg.labelKey) : translatedLabel
 
   return (
     <div
@@ -101,7 +115,7 @@ function SortableMetricCard({ cfg, analytics, ccySymbol, loading, t }: {
             {ccySymbol}{value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
           </p>
         )}
-        <p className="text-xs text-muted-foreground mt-0.5 leading-tight">{t(cfg.labelKey)}</p>
+        <p className="text-xs text-muted-foreground mt-0.5 leading-tight">{label}</p>
       </div>
     </div>
   )
@@ -135,25 +149,34 @@ function LoanHoverContent({ loanId, currency, principalAmount, t }: {
   t: (key: string, params?: Record<string, string>) => string
 }) {
   const [data, setData] = useState<{
-    paidCount: number; totalCount: number
-    totalPaid: number; totalExpected: number; penaltiesPaid: number
+    paidCount: number
+    totalCount: number
+    principalRecovered: number
+    totalOutstanding: number
+    penaltiesPaid: number
+    totalProfit: number
   } | null>(null)
   const sb = useMemo(() => createClient(), [])
 
   useEffect(() => {
     let cancelled = false
     sb.from('loan_installments')
-      .select('status, paid_amount, expected_amount, penalty_paid')
+      .select('installment_number, due_date, status, expected_amount, paid_amount, payment_history, penalty_paid, penalty_pending, penalty_waived')
       .eq('loan_id', loanId)
-      .neq('status', 'cancelled')
       .then(({ data: insts }) => {
         if (cancelled || !insts) return
-        const paidCount    = insts.filter(i => i.status === 'paid').length
-        const totalCount   = insts.length
-        const totalPaid    = insts.reduce((s, i) => s + Number(i.paid_amount || 0), 0)
-        const totalExpected = insts.reduce((s, i) => s + Number(i.expected_amount || 0), 0)
-        const penaltiesPaid = insts.reduce((s, i) => s + Number(i.penalty_paid || 0), 0)
-        setData({ paidCount, totalCount, totalPaid, totalExpected, penaltiesPaid })
+        const breakdown = computeLoanFinancialBreakdown({
+          principalAmount,
+          installments: insts as LoanFinancialInstallmentInput[],
+        })
+        setData({
+          paidCount: breakdown.paidCount,
+          totalCount: breakdown.totalCount,
+          principalRecovered: breakdown.principalRecovered,
+          totalOutstanding: breakdown.totalOutstanding,
+          penaltiesPaid: breakdown.penaltiesCollected,
+          totalProfit: breakdown.totalOperationProfit,
+        })
       })
     return () => { cancelled = true }
   }, [loanId, sb])
@@ -170,8 +193,6 @@ function LoanHoverContent({ loanId, currency, principalAmount, t }: {
     )
   }
 
-  const remaining   = Math.max(0, data.totalExpected - data.totalPaid)
-  const realProfit  = Math.max(0, data.totalPaid - principalAmount) + data.penaltiesPaid
   const progressPct = data.totalCount > 0 ? Math.round((data.paidCount / data.totalCount) * 100) : 0
 
   return (
@@ -195,12 +216,12 @@ function LoanHoverContent({ loanId, currency, principalAmount, t }: {
       {/* Stats grid */}
       <div className="grid grid-cols-2 gap-2">
         <div className="rounded-lg bg-muted/40 px-3 py-2">
-          <p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">{t('loans.drawer_total_paid')}</p>
-          <p className="text-sm font-bold text-emerald-500">{sym}{fmt(data.totalPaid)}</p>
+          <p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">{t('loans.analytics_total_recovered')}</p>
+          <p className="text-sm font-bold text-emerald-500">{sym}{fmt(data.principalRecovered)}</p>
         </div>
         <div className="rounded-lg bg-muted/40 px-3 py-2">
-          <p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">{t('loans.drawer_remaining')}</p>
-          <p className="text-sm font-bold text-rose-500">{sym}{fmt(remaining)}</p>
+          <p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">{t('loans.saldo_devedor')}</p>
+          <p className="text-sm font-bold text-rose-500">{sym}{fmt(data.totalOutstanding)}</p>
         </div>
         <div className="rounded-lg bg-muted/40 px-3 py-2">
           <p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">{t('loans.sidebar_stats_penalties')}</p>
@@ -208,7 +229,7 @@ function LoanHoverContent({ loanId, currency, principalAmount, t }: {
         </div>
         <div className="rounded-lg bg-muted/40 px-3 py-2">
           <p className="text-[9px] uppercase tracking-wider text-muted-foreground mb-0.5">{t('loans.hovercard_profit')}</p>
-          <p className="text-sm font-bold text-teal-500">{sym}{fmt(realProfit)}</p>
+          <p className="text-sm font-bold text-teal-500">{sym}{fmt(data.totalProfit)}</p>
         </div>
       </div>
     </div>
@@ -392,7 +413,7 @@ export default function LoansPage() {
     const { data: loanData } = await loanQuery
 
     if (!loanData?.length) {
-      setAnalytics({ totalLent: 0, profitProjection: 0, penaltiesCollected: 0, inArrears: 0, totalRecovered: 0, totalProfit: 0, totalOutstanding: 0 })
+      setAnalytics({ totalLent: 0, profitProjection: 0, penaltiesCollected: 0, penaltiesPending: 0, inArrears: 0, totalRecovered: 0, totalProfit: 0, totalOutstanding: 0 })
       setAnalyticsLoading(false)
       return
     }
@@ -412,43 +433,81 @@ export default function LoansPage() {
 
     const { data: instsRaw } = await sb
       .from('loan_installments')
-      .select('loan_id, expected_amount, paid_amount, penalty_paid, penalty_pending, status, due_date')
+      .select('loan_id, installment_number, due_date, expected_amount, paid_amount, payment_history, penalty_paid, penalty_pending, penalty_waived, status')
       .in('loan_id', loanIds)
 
     if (!instsRaw) {
-      setAnalytics({ totalLent, profitProjection: 0, penaltiesCollected: 0, inArrears: 0, totalRecovered: 0, totalProfit: 0, totalOutstanding: 0 })
+      setAnalytics({ totalLent, profitProjection: 0, penaltiesCollected: 0, penaltiesPending: 0, inArrears: 0, totalRecovered: 0, totalProfit: 0, totalOutstanding: 0 })
       setAnalyticsLoading(false)
       return
     }
 
-    // Apply per-installment currency conversion (each installment inherits its loan's currency)
-    const insts = instsRaw.map(i => {
-      const ccy = loanCcyMap.get(i.loan_id as string) ?? baseCcy
-      return {
-        ...i,
-        expected_amount:  toBase(Number(i.expected_amount), ccy),
-        paid_amount:      toBase(Number(i.paid_amount || 0), ccy),
-        penalty_paid:     toBase(Number(i.penalty_paid || 0), ccy),
-        penalty_pending:  toBase(Number(i.penalty_pending || 0), ccy),
+    const installmentsByLoan = new Map<string, LoanFinancialInstallmentInput[]>()
+
+    for (const row of instsRaw) {
+      const ccy = loanCcyMap.get(row.loan_id as string) ?? baseCcy
+      const convertedHistory = Array.isArray(row.payment_history)
+        ? row.payment_history.map((entry: Record<string, unknown>) => ({
+            ...entry,
+            amount: toBase(Number(entry?.amount || 0), ccy),
+            penalty_paid: toBase(Number(entry?.penalty_paid || 0), ccy),
+            forgiven_principal: toBase(Number(entry?.forgiven_principal || 0), ccy),
+            forgiven_penalty: toBase(Number(entry?.forgiven_penalty || 0), ccy),
+          }))
+        : []
+
+      const convertedInstallment: LoanFinancialInstallmentInput = {
+        ...row,
+        expected_amount: toBase(Number(row.expected_amount || 0), ccy),
+        paid_amount: toBase(Number(row.paid_amount || 0), ccy),
+        payment_history: convertedHistory,
+        penalty_paid: toBase(Number(row.penalty_paid || 0), ccy),
+        penalty_pending: toBase(Number(row.penalty_pending || 0), ccy),
+        penalty_waived: toBase(Number(row.penalty_waived || 0), ccy),
       }
+
+      const loanInstallments = installmentsByLoan.get(row.loan_id as string) ?? []
+      loanInstallments.push(convertedInstallment)
+      installmentsByLoan.set(row.loan_id as string, loanInstallments)
+    }
+
+    const combined = loanData.reduce((totals, loan) => {
+      const ccy = (loan.currency as string) || baseCcy
+      const principalAmount = toBase(Number(loan.principal_amount || 0), ccy)
+      const breakdown = computeLoanFinancialBreakdown({
+        principalAmount,
+        installments: installmentsByLoan.get(loan.id) ?? [],
+        today,
+      })
+
+      totals.totalRecovered += breakdown.principalRecovered
+      totals.penaltiesCollected += breakdown.penaltiesCollected
+      totals.penaltiesPending += breakdown.penaltiesPending
+      totals.inArrears += breakdown.inArrears
+      totals.totalOutstanding += breakdown.totalOutstanding
+      totals.profitProjection += breakdown.futureProfit
+      totals.totalProfit += breakdown.totalOperationProfit
+      return totals
+    }, {
+      totalRecovered: 0,
+      penaltiesCollected: 0,
+      penaltiesPending: 0,
+      inArrears: 0,
+      totalOutstanding: 0,
+      profitProjection: 0,
+      totalProfit: 0,
     })
 
-    const profitProjection   = insts.reduce((s, i) => s + i.expected_amount, 0) - totalLent
-    const penaltiesCollected = insts.reduce((s, i) => s + i.penalty_paid, 0)
-    const inArrears          = insts
-      .filter(i => i.status === 'overdue' || ((i.status === 'pending' || i.status === 'partial') && (i.due_date as string) < today))
-      .reduce((s, i) => s + Math.max(0, i.expected_amount - i.paid_amount), 0)
-    const totalRecovered     = insts.reduce((s, i) => s + i.paid_amount + i.penalty_paid, 0)
-    // Total Profit = realized interest (paid back minus lent) + penalties received
-    const interestReceived   = Math.max(0, insts.filter(i => i.status === 'paid').reduce((s, i) => s + i.paid_amount, 0) - totalLent)
-    const totalProfit        = interestReceived + penaltiesCollected
-
-    // Total Outstanding = remaining principal + accrued fees across active installments
-    const totalOutstanding = insts
-      .filter(i => i.status === 'pending' || i.status === 'partial' || i.status === 'overdue')
-      .reduce((s, i) => s + Math.max(0, i.expected_amount - i.paid_amount) + i.penalty_pending, 0)
-
-    setAnalytics({ totalLent, profitProjection, penaltiesCollected, inArrears, totalRecovered, totalProfit, totalOutstanding })
+    setAnalytics({
+      totalLent,
+      totalRecovered: combined.totalRecovered,
+      penaltiesCollected: combined.penaltiesCollected,
+      penaltiesPending: combined.penaltiesPending,
+      inArrears: combined.inArrears,
+      totalOutstanding: combined.totalOutstanding,
+      profitProjection: combined.profitProjection,
+      totalProfit: combined.totalProfit,
+    })
     setAnalyticsLoading(false)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [businessId, sb, selectedCurrency, currency, analyticsScope])

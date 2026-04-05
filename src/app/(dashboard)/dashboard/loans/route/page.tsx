@@ -4,6 +4,7 @@ import { useState, useEffect, useMemo } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { useTenant } from '@/hooks/useTenant'
 import { useTranslation } from '@/hooks/useTranslation'
+import { computeInstallmentDueAmount } from '@/lib/utils/loan-financials'
 import { Loader2, Search, MapPin, Phone, AlertCircle, ChevronRight } from 'lucide-react'
 import { InstallmentsDrawer } from '@/components/dashboard/loans/InstallmentsDrawer'
 
@@ -13,6 +14,8 @@ interface RouteInstallment {
   due_date: string
   expected_amount: number
   paid_amount: number
+  penalty_pending: number
+  payment_history?: Array<{ amount?: number; penalty_paid?: number }>
   status: 'pending' | 'partial' | 'overdue'
   loans: {
     id: string
@@ -58,6 +61,8 @@ export default function RouteDashboard() {
         due_date,
         expected_amount,
         paid_amount,
+        penalty_pending,
+        payment_history,
         status,
         loans!inner (
           id,
@@ -163,7 +168,7 @@ export default function RouteDashboard() {
         ) : (
           filtered.map(inst => {
             const customer = inst.loans.customers
-            const remaining = inst.expected_amount - inst.paid_amount
+            const due = computeInstallmentDueAmount(inst)
             const isOverdue = inst.status === 'overdue'
 
             return (
@@ -187,7 +192,7 @@ export default function RouteDashboard() {
                   </div>
                   <div className="text-right">
                     <p className={`text-lg font-bold ${isOverdue ? 'text-destructive' : 'text-amber-500'}`}>
-                      ${formatMoney(remaining)}
+                      ${formatMoney(due.totalDue)}
                     </p>
                   </div>
                 </div>
