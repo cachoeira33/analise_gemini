@@ -11,6 +11,9 @@ import { useTenant } from '@/hooks/useTenant'
 import { useAuthUser } from '@/components/providers/AuthUserProvider'
 import { useTranslation } from '@/hooks/useTranslation'
 import { cn } from '@/lib/utils'
+import { getEffectivePaidAmount } from '@/lib/utils/loan-financials'
+import { ensureInitialLoanAgreement, replaceActiveLoanAgreement } from '@/lib/utils/loan-agreements'
+import { InfoTooltip } from '@/components/ui/InfoTooltip'
 
 interface Installment {
   id: string
@@ -19,6 +22,9 @@ interface Installment {
   expected_amount: number
   paid_amount: number
   status: 'pending' | 'partial' | 'paid' | 'overdue' | 'cancelled'
+  payment_history?: Array<{
+    amount?: number | string | null
+  }>
 }
 
 interface LoanConfig {
@@ -57,7 +63,7 @@ function calcSettlement(
 
   for (const inst of insts) {
     if (inst.status === 'paid' || inst.status === 'cancelled') continue
-    const remaining = Math.max(0, Number(inst.expected_amount) - Number(inst.paid_amount))
+    const remaining = Math.max(0, Number(inst.expected_amount) - getEffectivePaidAmount(inst))
     if (remaining === 0) continue
 
     originalRemaining += remaining
@@ -146,6 +152,10 @@ export function RenegotiationModal({
   const [proposalCopied,       setProposalCopied]       = useState(false)
 
   const ccySymbol = loanConfig.currency ?? 'BRL'
+  const tooltipText = (key: string, fallback: string) => {
+    const translated = t(key)
+    return translated === key ? fallback : translated
+  }
 
   const activeInstallments = installments.filter(
     i => i.status === 'pending' || i.status === 'partial' || i.status === 'overdue'
@@ -226,6 +236,8 @@ export function RenegotiationModal({
     setSaving(true)
 
     try {
+      await ensureInitialLoanAgreement(sb, loanId)
+
       // 1. Cancel all active installments
       const activeIds = activeInstallments.map(i => i.id)
       if (activeIds.length > 0) {
@@ -238,9 +250,28 @@ export function RenegotiationModal({
       }
 
       // 2. Build due-date sequence using the new frequency
+      const agreementId = await replaceActiveLoanAgreement(sb, {
+        loanId,
+        kind: 'renegotiation',
+        principalBase: settlement.originalRemaining,
+        penaltyBase: forgivePenalties ? 0 : settlement.totalPenalties,
+        interestRatePct: rate,
+        interestAmount: totalInterest,
+        totalAmount: newTotal,
+        totalInstallments: n,
+        frequency: newFrequency,
+        firstDueDate,
+        metadata: {
+          customer: customerName,
+          renegotiation_date: renegoDate,
+          forgave_penalties: forgivePenalties,
+        },
+      })
+
       const dueDates = buildDueDates(firstDueDate, n, newFrequency)
       const maxNum   = installments.reduce((acc, i) => Math.max(acc, i.installment_number), 0)
       const rows = dueDates.map((dd, idx) => ({
+        agreement_id:      agreementId,
         loan_id:            loanId,
         installment_number: maxNum + 1 + idx,
         due_date:           dd,
@@ -320,6 +351,7 @@ export function RenegotiationModal({
             <label className="flex items-center gap-2 text-sm font-medium text-foreground mb-1.5">
               <Clock className="h-4 w-4 text-muted-foreground" />
               {t('loans.renegotiate_date_label')}
+              <InfoTooltip text={tooltipText('loans.tooltips.renegotiate_date', 'Date used to calculate the settlement base and any penalties before creating the new agreement.')} />
               <span className="text-[10px] text-muted-foreground font-normal ml-1">
                 ({t('loans.renegotiate_date_hint')})
               </span>
@@ -380,6 +412,9 @@ export function RenegotiationModal({
             <label className="flex items-center justify-between gap-3 rounded-xl border border-border bg-muted/10 px-4 py-3 cursor-pointer hover:bg-muted/20 transition-colors">
               <div>
                 <p className="text-sm font-medium text-foreground">{t('loans.renegotiate_forgive_penalties')}</p>
+                <div className="mt-1">
+                  <InfoTooltip text={tooltipText('loans.tooltips.renegotiate_forgive_penalties', 'When enabled, pending penalties stay in history but do not enter the new agreement base.')} />
+                </div>
                 <p className="text-xs text-muted-foreground mt-0.5">
                   {ccySymbol}{fmt(settlement.totalPenalties)} {t('loans.renegotiate_forgive_desc')}
                 </p>
@@ -404,6 +439,7 @@ export function RenegotiationModal({
             <label className="flex items-center gap-2 text-sm font-medium text-foreground mb-1.5">
               <Hash className="h-4 w-4 text-muted-foreground" />
               {t('loans.renegotiate_installments_count')}
+              <InfoTooltip text={tooltipText('loans.tooltips.renegotiate_installments_count', 'Number of installments that will be created in the new agreement.')} />
             </label>
             <div className="flex items-center gap-2">
               <input
@@ -421,6 +457,7 @@ export function RenegotiationModal({
             <label className="flex items-center gap-2 text-sm font-medium text-foreground mb-1.5">
               <BadgePercent className="h-4 w-4 text-muted-foreground" />
               {t('loans.renegotiate_new_rate')}
+              <InfoTooltip text={tooltipText('loans.tooltips.renegotiate_rate', 'Flat percentage applied once to the settlement base in this restructuring flow.')} />
             </label>
             <div className="relative">
               <input

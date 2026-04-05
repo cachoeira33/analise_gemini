@@ -12,9 +12,12 @@ import { useTranslation } from '@/hooks/useTranslation'
 import { cn } from '@/lib/utils'
 import { usePreferencesStore } from '@/lib/stores/usePreferencesStore'
 import { formatDateGlobal } from '@/lib/formatDate'
+import { computeLoanFinancialBreakdown, getEffectivePaidAmount } from '@/lib/utils/loan-financials'
 import { useAuthUser } from '@/components/providers/AuthUserProvider'
 import { useSubscription } from '@/hooks/useSubscription'
 import { RenegotiationModal } from './RenegotiationModal'
+import { InfoTooltip } from '@/components/ui/InfoTooltip'
+import { ensureInitialLoanAgreement, getActiveLoanAgreementId, replaceActiveLoanAgreement } from '@/lib/utils/loan-agreements'
 
 interface PaymentHistoryEntry {
   date: string   // YYYY-MM-DD
@@ -25,10 +28,17 @@ interface PaymentHistoryEntry {
   asset_url?: string | null
   forgiven_principal?: number
   forgiven_penalty?: number
+  principal_component?: number
+  interest_component?: number
+  fee_component?: number
+  note?: string
+  is_late?: boolean
+  days_late?: number
 }
 
 interface Installment {
   id: string
+  agreement_id?: string | null
   installment_number: number
   due_date: string
   expected_amount: number
@@ -49,6 +59,24 @@ interface LoanConfig {
   /** ISO 4217 currency code for this loan (GBP, USD, EUR, …) */
   currency: string
   frequency: string
+}
+
+interface LoanAgreement {
+  id: string
+  agreement_number: number
+  kind: 'initial' | 'renegotiation' | 'renewal' | 'manual_restructure'
+  status: 'active' | 'superseded' | 'closed' | 'cancelled'
+  principal_base: number
+  penalty_base: number
+  interest_rate_pct: number
+  interest_amount: number
+  total_amount: number
+  total_installments: number
+  frequency: string | null
+  first_due_date: string | null
+  created_at: string
+  superseded_at?: string | null
+  metadata?: Record<string, unknown> | null
 }
 
 interface SettlementRow {
@@ -94,7 +122,7 @@ function computePenaltyAtDate(inst: Installment, config: LoanConfig, payDateISO:
   if (isNaN(payRef.getTime()) || isNaN(dueRef.getTime())) return 0
   const daysLate = Math.max(0, Math.floor((payRef.getTime() - dueRef.getTime()) / 86_400_000))
   if (daysLate === 0) return 0
-  const remaining = Math.max(0, Number(inst.expected_amount) - Number(inst.paid_amount))
+  const remaining = Math.max(0, Number(inst.expected_amount) - getEffectivePaidAmount(inst))
   // Force numeric coercion — values may arrive as strings from Supabase
   const fixedFee = Number(config.late_fee_fixed) || 0
   const flatDaily = Number(config.late_fee_flat_daily) || 0
@@ -128,7 +156,7 @@ function calcSettlement(insts: Installment[], config: LoanConfig, asOfDate?: Dat
 
   for (const inst of insts) {
     if (inst.status === 'paid' || inst.status === 'cancelled') continue
-    const remaining = Math.max(0, Number(inst.expected_amount) - Number(inst.paid_amount))
+    const remaining = Math.max(0, Number(inst.expected_amount) - getEffectivePaidAmount(inst))
     if (remaining === 0) continue
 
     originalRemaining += remaining
@@ -161,6 +189,36 @@ function calcSettlement(insts: Installment[], config: LoanConfig, asOfDate?: Dat
 const fmt = (n: number) => n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const todayISO = () => new Date().toISOString().split('T')[0]
 
+function buildStatusFromAmounts(
+  expectedAmount: number,
+  paidAmount: number,
+  dueDate: string,
+): Installment['status'] {
+  if (paidAmount >= expectedAmount && expectedAmount > 0) return 'paid'
+  if (paidAmount > 0) return 'partial'
+  return dueDate < todayISO() ? 'overdue' : 'pending'
+}
+
+function materializeHistory(inst: Installment): PaymentHistoryEntry[] {
+  if ((inst.payment_history ?? []).length > 0) {
+    return [...inst.payment_history]
+  }
+
+  const legacyPaid = Math.max(0, Number(inst.paid_amount) || 0)
+  const legacyPenalty = Math.max(0, Number(inst.penalty_paid) || 0)
+  if (legacyPaid <= 0 && legacyPenalty <= 0) {
+    return []
+  }
+
+  return [{
+    date: inst.paid_at ? inst.paid_at.split('T')[0] : todayISO(),
+    amount: legacyPaid,
+    penalty_paid: legacyPenalty,
+    method: 'cash',
+    note: 'legacy-sync',
+  }]
+}
+
 import { useMyShift } from '@/hooks/useMyShift'
 import { Lock, Trash2 } from 'lucide-react'
 
@@ -188,6 +246,7 @@ export function InstallmentsDrawer({
 
   const [customerLang, setCustomerLang] = useState<string>('en')
   const [installments, setInstallments] = useState<Installment[]>([])
+  const [agreements, setAgreements] = useState<LoanAgreement[]>([])
   const [loading, setLoading] = useState(true)
   const [loanConfig, setLoanConfig] = useState<LoanConfig>({ late_fee_fixed: 0, late_fee_daily_pct: 0, late_fee_flat_daily: 0, is_interest_frozen: false, currency: '', frequency: 'monthly' })
   // Customer ID for linking payments as proper ledger entries
@@ -227,6 +286,7 @@ export function InstallmentsDrawer({
   // Schedule edit (pending)
   const [editDueDate, setEditDueDate] = useState('')
   const [editExpected, setEditExpected] = useState('')
+  const [editPenaltyPending, setEditPenaltyPending] = useState('')
   // Payment correction (paid / partial)
   const [editPaidAmount, setEditPaidAmount] = useState('')
   const [editPaidAt, setEditPaidAt] = useState('')
@@ -249,6 +309,7 @@ export function InstallmentsDrawer({
   const [renewPaidToday, setRenewPaidToday] = useState('')
   const [renewDueDate, setRenewDueDate] = useState('')
   const [renewInterestRate, setRenewInterestRate] = useState('0')
+  const [renewMode, setRenewMode] = useState<'capitalize_balance' | 'interest_only'>('capitalize_balance')
   const [savingRenewal, setSavingRenewal] = useState(false)
 
   // ── Principal amount (from loans row) ────────────────────────────────────
@@ -292,11 +353,16 @@ export function InstallmentsDrawer({
 
   const fetchInstallments = async () => {
     setLoading(true)
-    const { data, error } = await sb
-      .from('loan_installments').select('*').eq('loan_id', loanId)
-      .order('installment_number', { ascending: true })
+    const [{ data, error }, { data: agreementsData, error: agreementsError }] = await Promise.all([
+      sb.from('loan_installments').select('*').eq('loan_id', loanId)
+        .order('installment_number', { ascending: true }),
+      sb.from('loan_agreements').select('*').eq('loan_id', loanId)
+        .order('agreement_number', { ascending: false }),
+    ])
     if (error) toast.error(error.message)
     else setInstallments((data || []) as Installment[])
+    if (agreementsError) toast.error(agreementsError.message)
+    else setAgreements((agreementsData || []) as LoanAgreement[])
     setLoading(false)
   }
 
@@ -333,16 +399,27 @@ export function InstallmentsDrawer({
   // ── Start edit — branches on installment status ───────────────────────────
   const startEdit = (inst: Installment) => {
     setEditingId(inst.id)
+    setEditingHistoryIdx(null)
     setReceivingId(null)
+    setEditDueDate(inst.due_date)
+    setEditExpected(String(inst.expected_amount))
+    setEditPenaltyPending(String(inst.penalty_pending ?? 0))
     if (inst.status === 'paid' || inst.status === 'partial') {
       // Payment correction mode
       setEditPaidAmount(String(inst.paid_amount))
       setEditPaidAt(inst.paid_at ? inst.paid_at.split('T')[0] : todayISO())
-    } else {
-      // Schedule edit mode
-      setEditDueDate(inst.due_date)
-      setEditExpected(String(inst.expected_amount))
     }
+  }
+
+  const startHistoryEdit = (inst: Installment, historyIdx: number) => {
+    const entry = inst.payment_history[historyIdx]
+    setEditingId(inst.id)
+    setEditingHistoryIdx(historyIdx)
+    setReceivingId(null)
+    setHistoryEditAmount(String(entry.amount ?? 0))
+    setHistoryEditPenalty(String(entry.penalty_paid ?? 0))
+    setHistoryEditDate(entry.date ?? todayISO())
+    setHistoryEditReason('')
   }
 
   // ── Receive Payment — Accumulator (no row splitting) ─────────────────────
@@ -398,7 +475,7 @@ export function InstallmentsDrawer({
       if (receivedRemaining <= 0) break
 
       const expected = Number(currentInst.expected_amount)
-      const currentPaid = Number(currentInst.paid_amount)
+      const currentPaid = getEffectivePaidAmount(currentInst)
       const shortfall = Math.max(0, expected - currentPaid)
 
       if (shortfall <= 0) continue
@@ -416,7 +493,13 @@ export function InstallmentsDrawer({
       const historyEntry: PaymentHistoryEntry = payMethod === 'asset'
         ? { date: payDate, amount: amountToApply, method: 'asset', asset_description: assetDesc, asset_url: finalAssetUrl, ...entryPenalty }
         : { date: payDate, amount: amountToApply, method: payMethod, ...entryPenalty }
-      const updatedHistory = [...(currentInst.payment_history ?? []), historyEntry]
+      const updatedHistory = [...materializeHistory(currentInst), historyEntry]
+      const nextPenaltyPaid = currentInst.id === inst.id
+        ? (Number(currentInst.penalty_paid) || 0) + penaltyPaidAmt
+        : Number(currentInst.penalty_paid) || 0
+      const nextPenaltyWaived = currentInst.id === inst.id
+        ? (Number(currentInst.penalty_waived) || 0) + penaltyWaivedAmt
+        : Number(currentInst.penalty_waived) || 0
 
       updates.push({
         id: currentInst.id,
@@ -428,8 +511,8 @@ export function InstallmentsDrawer({
         lng: gps?.lng ?? null,
         // Penalty tracking: recorded on the primary installment only
         ...(currentInst.id === inst.id ? {
-          penalty_paid: penaltyPaidAmt,
-          penalty_waived: penaltyWaivedAmt,
+          penalty_paid: nextPenaltyPaid,
+          penalty_waived: nextPenaltyWaived,
           penalty_pending: carryOverPending ? 0 : penaltyPendingAmt,
         } : {}),
       })
@@ -530,21 +613,40 @@ export function InstallmentsDrawer({
   // ── Save Schedule Edit (pending installments) ─────────────────────────────
   const handleSaveEdit = async (inst: Installment) => {
     const newExpected = parseFloat(editExpected)
-    if (!editDueDate || isNaN(newExpected) || newExpected <= 0) return toast.error(t('loans.error_invalid_edit'))
+    const newPenaltyPending = parseFloat(editPenaltyPending)
+    if (!editDueDate || isNaN(newExpected) || newExpected <= 0 || isNaN(newPenaltyPending) || newPenaltyPending < 0) {
+      return toast.error(t('loans.error_invalid_edit'))
+    }
     setSavingEdit(true)
-    const { error } = await sb.from('loan_installments').update({ due_date: editDueDate, expected_amount: newExpected }).eq('id', inst.id)
-    if (error) { toast.error(error.message) } else { toast.success(t('loans.edit_inst_success')); setEditingId(null); fetchInstallments() }
+    const effectivePaid = getEffectivePaidAmount(inst)
+    const nextStatus = buildStatusFromAmounts(newExpected, effectivePaid, editDueDate)
+    const { error } = await sb.from('loan_installments').update({
+      due_date: editDueDate,
+      expected_amount: newExpected,
+      penalty_pending: newPenaltyPending,
+      paid_amount: effectivePaid,
+      status: nextStatus,
+      paid_at: nextStatus === 'paid' ? (inst.paid_at ?? new Date().toISOString()) : null,
+    }).eq('id', inst.id)
+    if (error) {
+      toast.error(error.message)
+    } else {
+      toast.success(t('loans.edit_inst_success'))
+      setEditingId(null)
+      fetchInstallments()
+    }
     setSavingEdit(false)
   }
 
   // ── Save Payment Correction (paid / partial installments) ─────────────────
   const handleSaveEditPayment = async (inst: Installment) => {
+    if ((inst.payment_history ?? []).length > 0) {
+      return toast.error(t('loans.edit_history_instead') || 'Edit payment entries below for installments with payment history')
+    }
     const amount = parseFloat(editPaidAmount)
     if (isNaN(amount) || amount < 0) return toast.error(t('loans.error_invalid_amount'))
     setSavingEdit(true)
-    const newStatus = amount >= Number(inst.expected_amount) ? 'paid'
-      : amount > 0 ? 'partial'
-        : 'pending'
+    const newStatus = buildStatusFromAmounts(Number(inst.expected_amount), amount, inst.due_date)
     const paidAtValue = newStatus === 'paid'
       ? new Date(editPaidAt + 'T12:00:00').toISOString()
       : null
@@ -588,14 +690,12 @@ export function InstallmentsDrawer({
     const totalPen = updatedHistory.reduce((acc, h) => acc + (Number(h.penalty_paid) || 0), 0)
 
     // Recalculate status based on total paid vs expected
-    const newStatus = totalPaid >= Number(inst.expected_amount) ? 'paid'
-      : totalPaid > 0 ? 'partial'
-        : 'pending'
+    const newStatus = buildStatusFromAmounts(Number(inst.expected_amount), totalPaid, inst.due_date)
 
     // If status is paid, use the corrected payment date; otherwise preserve existing paid_at
     const correctedPaidAt = newStatus === 'paid'
       ? new Date(newDate + 'T12:00:00').toISOString()
-      : inst.paid_at
+      : null
 
     // 1. Update Installment
     const { error: upError } = await sb.from('loan_installments')
@@ -648,7 +748,8 @@ export function InstallmentsDrawer({
   // amount=0 (no cash received). penalty_waived accumulates ONLY forgiven penalties.
   // No transaction row is created — this is a balance forgiveness, not money received.
   const handleWaiveAndClose = async (inst: Installment) => {
-    const remaining = Math.max(0, Number(inst.expected_amount) - Number(inst.paid_amount))
+    const effectivePaid = getEffectivePaidAmount(inst)
+    const remaining = Math.max(0, Number(inst.expected_amount) - effectivePaid)
     const penaltyPending = Number(inst.penalty_pending) || 0
 
     // payment_history entry — amount:0 signals no cash was received
@@ -663,11 +764,11 @@ export function InstallmentsDrawer({
 
     const { error } = await sb.from('loan_installments').update({
       status: 'paid',
-      paid_amount: Number(inst.expected_amount),   // settles the record (not cash)
+      paid_amount: effectivePaid,
       penalty_waived: (Number(inst.penalty_waived) || 0) + penaltyPending,  // penalties only
       penalty_pending: 0,
-      paid_at: new Date().toISOString(),
-      payment_history: [...(inst.payment_history || []), waiveEntry],
+      paid_at: inst.paid_at,
+      payment_history: [...materializeHistory(inst), waiveEntry],
     }).eq('id', inst.id)
     if (error) { toast.error(error.message) } else {
       toast.success(t('loans.waive_close_success'))
@@ -691,7 +792,8 @@ export function InstallmentsDrawer({
   // ── Rollover to Next Installment ──────────────────────────────────────────
   // Transfers remaining principal + pending penalties to the next pending installment.
   const handleRolloverToNext = async (inst: Installment) => {
-    const remaining = Math.max(0, Number(inst.expected_amount) - Number(inst.paid_amount))
+    const effectivePaid = getEffectivePaidAmount(inst)
+    const remaining = Math.max(0, Number(inst.expected_amount) - effectivePaid)
     const penaltyPending = Number(inst.penalty_pending) || 0
     const rolloverAmt = remaining + penaltyPending
     if (rolloverAmt <= 0) return toast.error(t('loans.rollover_nothing_to_move'))
@@ -708,13 +810,32 @@ export function InstallmentsDrawer({
       .eq('id', nextInst.id)
     if (nextErr) return toast.error(nextErr.message)
 
+    const rolloverEntry: PaymentHistoryEntry = {
+      date: todayISO(),
+      amount: 0,
+      method: 'cash',
+      note: `balance-moved-to-${nextInst.installment_number}`,
+    }
+
     const { error } = await sb.from('loan_installments').update({
-      status: 'paid',
-      paid_amount: Number(inst.expected_amount),
+      status: 'cancelled',
+      paid_amount: effectivePaid,
       penalty_pending: 0,
-      paid_at: new Date().toISOString(),
+      paid_at: inst.paid_at,
+      payment_history: [...materializeHistory(inst), rolloverEntry],
     }).eq('id', inst.id)
     if (error) { toast.error(error.message) } else {
+      if (user && businessId) {
+        await sb.from('audit_logs').insert({
+          business_id: businessId,
+          user_id: user.id,
+          action: 'ROLLOVER',
+          entity_type: 'loan_installment',
+          entity_id: inst.id,
+          old_values: { status: inst.status, penalty_pending: inst.penalty_pending },
+          new_values: { status: 'cancelled', moved_to_installment: nextInst.installment_number, moved_amount: rolloverAmt },
+        })
+      }
       toast.success(t('loans.rollover_success', { n: String(nextInst.installment_number), amount: `${ccySymbol}${fmt(rolloverAmt)}` }))
       fetchInstallments()
     }
@@ -722,7 +843,8 @@ export function InstallmentsDrawer({
 
   // ── Rollover to Final Installment ─────────────────────────────────────────
   const handleRolloverToFinal = async (inst: Installment) => {
-    const remaining = Math.max(0, Number(inst.expected_amount) - Number(inst.paid_amount))
+    const effectivePaid = getEffectivePaidAmount(inst)
+    const remaining = Math.max(0, Number(inst.expected_amount) - effectivePaid)
     const penaltyPending = Number(inst.penalty_pending) || 0
     const rolloverAmt = remaining + penaltyPending
     if (rolloverAmt <= 0) return toast.error(t('loans.rollover_nothing_to_move'))
@@ -739,13 +861,32 @@ export function InstallmentsDrawer({
       .eq('id', finalInst.id)
     if (finalErr) return toast.error(finalErr.message)
 
+    const rolloverEntry: PaymentHistoryEntry = {
+      date: todayISO(),
+      amount: 0,
+      method: 'cash',
+      note: `balance-moved-to-${finalInst.installment_number}`,
+    }
+
     const { error } = await sb.from('loan_installments').update({
-      status: 'paid',
-      paid_amount: Number(inst.expected_amount),
+      status: 'cancelled',
+      paid_amount: effectivePaid,
       penalty_pending: 0,
-      paid_at: new Date().toISOString(),
+      paid_at: inst.paid_at,
+      payment_history: [...materializeHistory(inst), rolloverEntry],
     }).eq('id', inst.id)
     if (error) { toast.error(error.message) } else {
+      if (user && businessId) {
+        await sb.from('audit_logs').insert({
+          business_id: businessId,
+          user_id: user.id,
+          action: 'ROLLOVER',
+          entity_type: 'loan_installment',
+          entity_id: inst.id,
+          old_values: { status: inst.status, penalty_pending: inst.penalty_pending },
+          new_values: { status: 'cancelled', moved_to_installment: finalInst.installment_number, moved_amount: rolloverAmt },
+        })
+      }
       toast.success(t('loans.rollover_final_success', { n: String(finalInst.installment_number), amount: `${ccySymbol}${fmt(rolloverAmt)}` }))
       setRolloverMenuId(null)
       fetchInstallments()
@@ -766,45 +907,50 @@ export function InstallmentsDrawer({
     if (!renewDueDate) return toast.error('New due date is required')
 
     // Outstanding = remaining principal + pending penalty on this installment
-    const remaining = Math.max(0, Number(inst.expected_amount) - Number(inst.paid_amount))
+    const effectivePaid = getEffectivePaidAmount(inst)
+    const remaining = Math.max(0, Number(inst.expected_amount) - effectivePaid)
     const penaltyPending = Number(inst.penalty_pending) || 0
     const outstandingBalance = remaining + penaltyPending
+    const carriedPenaltyBase = penaltyPending
 
     if (paidToday > outstandingBalance) {
       return toast.error('Amount paid today cannot exceed outstanding balance')
     }
 
     // New principal = what is still owed after today's payment
-    const remainingPrincipal = Math.max(0, outstandingBalance - paidToday)
+    const remainingPrincipal = renewMode === 'interest_only'
+      ? Math.max(0, financialBreakdown.principalRemaining)
+      : Math.max(0, outstandingBalance - paidToday)
     // Interest for new period = flat rate on remaining principal (0% → no interest charge)
     const interestForNewPeriod = remainingPrincipal * (interestRate / 100)
     // New expected = principal + interest
-    const newExpectedAmount = remainingPrincipal + interestForNewPeriod
+    const newExpectedAmount = remainingPrincipal + carriedPenaltyBase + interestForNewPeriod
 
     setSavingRenewal(true)
 
     // ── Step 1: record today's payment on the current installment ───────────
-    const newPaidAmount = Number(inst.paid_amount) + paidToday
     const updatedHistory: PaymentHistoryEntry[] = [
-      ...(inst.payment_history ?? []),
+      ...materializeHistory(inst),
       ...(paidToday > 0 ? [{
         date: todayISO(),
         amount: paidToday,
         method: 'renewal_fee' as const,
+        interest_component: paidToday,
+        note: 'renewal-fee',
       } satisfies PaymentHistoryEntry] : []),
     ]
+    const newPaidAmount = updatedHistory.reduce((sum, entry) => sum + (Number(entry.amount) || 0), 0)
 
     // ── Step 2: close the current installment cleanly ────────────────────────
     // Set expected_amount = new paid_amount so the balance lands at exactly 0.
-    // If nothing was paid, mark as cancelled instead.
-    const closedStatus: Installment['status'] = newPaidAmount > 0 ? 'paid' : 'cancelled'
+    // Supersede the original installment without mutating its expected amount.
+    const closedStatus: Installment['status'] = 'cancelled'
 
     const { error: updateErr } = await sb.from('loan_installments').update({
       paid_amount: newPaidAmount,
-      expected_amount: newPaidAmount,   // balance → 0 (no phantom debt)
       status: closedStatus,
       penalty_pending: 0,
-      paid_at: newPaidAmount > 0 ? new Date().toISOString() : null,
+      paid_at: inst.paid_at,
       payment_history: updatedHistory,
     }).eq('id', inst.id)
 
@@ -814,12 +960,38 @@ export function InstallmentsDrawer({
     }
 
     // ── Step 3: create new pending installment ───────────────────────────────
+    await ensureInitialLoanAgreement(sb, loanId)
+    const otherActiveInstallments = installments.filter(
+      i => i.id !== inst.id && (i.status === 'pending' || i.status === 'partial' || i.status === 'overdue'),
+    )
+    const agreementId = otherActiveInstallments.length === 0
+      ? await replaceActiveLoanAgreement(sb, {
+        loanId,
+        kind: 'renewal',
+        principalBase: remainingPrincipal,
+        penaltyBase: carriedPenaltyBase,
+        interestRatePct: interestRate,
+        interestAmount: interestForNewPeriod,
+        totalAmount: newExpectedAmount,
+        totalInstallments: 1,
+        frequency: loanConfig.frequency,
+        firstDueDate: renewDueDate,
+        metadata: {
+          source_installment: inst.installment_number,
+          paid_today: paidToday,
+          previous_penalty_base: penaltyPending,
+          renew_mode: renewMode,
+        },
+      })
+      : await getActiveLoanAgreementId(sb, loanId)
+
     const lastInst = [...installments]
       .filter(i => i.status !== 'cancelled')
       .sort((a, b) => b.installment_number - a.installment_number)[0]
     const newNumber = (lastInst?.installment_number ?? 0) + 1
 
     const { error: insertErr } = await sb.from('loan_installments').insert({
+      agreement_id: agreementId,
       loan_id: loanId,
       installment_number: newNumber,
       due_date: renewDueDate,
@@ -865,26 +1037,15 @@ export function InstallmentsDrawer({
     const newPaidAmount = Math.max(0, newHistory.reduce((acc, h) => acc + Number(h.amount || 0), 0))
     const newPenaltyPaid = Math.max(0, newHistory.reduce((acc, h) => acc + Number(h.penalty_paid || 0), 0))
 
-    // Recompute status after removal
-    // Note: for renewal-closed installments expected_amount == old paid_amount;
-    // we use the *original* expected_amount as the threshold, not the new paid.
-    const expected = Number(inst.expected_amount)
-    let newStatus: Installment['status']
-    if (newPaidAmount <= 0) {
-      const today = new Date()
-      const due = new Date(inst.due_date + 'T00:00:00')
-      newStatus = today > due ? 'overdue' : 'pending'
-    } else if (newPaidAmount < expected) {
-      newStatus = 'partial'
-    } else {
-      newStatus = 'paid'
-    }
+    const newStatus = buildStatusFromAmounts(Number(inst.expected_amount), newPaidAmount, inst.due_date)
 
     const { error } = await sb.from('loan_installments').update({
       paid_amount: newPaidAmount,
       penalty_paid: newPenaltyPaid,
       status: newStatus,
-      paid_at: newHistory.length > 0 ? (newHistory[newHistory.length - 1] as PaymentHistoryEntry).date : null,
+      paid_at: newStatus === 'paid' && newHistory.length > 0
+        ? new Date(`${(newHistory[newHistory.length - 1] as PaymentHistoryEntry).date}T12:00:00`).toISOString()
+        : null,
       payment_history: newHistory,
     }).eq('id', inst.id)
 
@@ -900,6 +1061,37 @@ export function InstallmentsDrawer({
     }
 
     toast.success(t('loans.payment_deleted'))
+    fetchInstallments()
+  }
+
+  const handleReopenInstallment = async (inst: Installment) => {
+    const effectivePaid = getEffectivePaidAmount(inst)
+    const nextStatus = buildStatusFromAmounts(Number(inst.expected_amount), effectivePaid, inst.due_date)
+
+    const { error } = await sb.from('loan_installments').update({
+      status: nextStatus,
+      paid_amount: effectivePaid,
+      paid_at: nextStatus === 'paid' ? inst.paid_at : null,
+    }).eq('id', inst.id)
+
+    if (error) {
+      toast.error(error.message)
+      return
+    }
+
+    if (user && businessId) {
+      await sb.from('audit_logs').insert({
+        business_id: businessId,
+        user_id: user.id,
+        action: 'REOPEN_INSTALLMENT',
+        entity_type: 'loan_installment',
+        entity_id: inst.id,
+        old_values: { status: inst.status, paid_amount: inst.paid_amount },
+        new_values: { status: nextStatus, paid_amount: effectivePaid },
+      })
+    }
+
+    toast.success(t('loans.reopen_success') || 'Installment reopened')
     fetchInstallments()
   }
 
@@ -1000,40 +1192,34 @@ export function InstallmentsDrawer({
   // ── Totals (exclude cancelled) ────────────────────────────────────────────
   const activeInsts = installments.filter((i: Installment) => i.status !== 'cancelled')
   const totalExpected = activeInsts.reduce((acc: number, c: Installment) => acc + Number(c.expected_amount), 0)
-  const totalPaid    = activeInsts.reduce((acc: number, c: Installment) => acc + Number(c.paid_amount), 0)
+  const totalPaid = activeInsts.reduce((acc: number, c: Installment) => acc + getEffectivePaidAmount(c), 0)
   const totalRemaining = totalExpected - totalPaid
+  const todayStr = todayISO()
+  const financialBreakdown = useMemo(
+    () => computeLoanFinancialBreakdown({
+      principalAmount: loanPrincipal ?? 0,
+      installments,
+      today: todayStr,
+    }),
+    [installments, loanPrincipal, todayStr],
+  )
 
   // ── Total Recovered — absolute sum of every cash entry in payment_history ─
   // Includes principal payments, interest payments, and penalty payments.
-  const totalRecovered = installments.reduce((acc: number, inst: Installment) => {
-    return acc + (inst.payment_history ?? []).reduce(
-      (s: number, h: PaymentHistoryEntry) => s + (Number(h.amount) || 0) + (Number(h.penalty_paid) || 0),
-      0,
-    )
-  }, 0)
+  const totalRecovered = financialBreakdown.principalRecovered
 
   // ── Saldo Devedor Total — everything the client still owes ────────────────
-  const totalOutstanding = installments
-    .filter((i: Installment) => i.status === 'pending' || i.status === 'partial' || i.status === 'overdue')
-    .reduce((acc: number, i: Installment) =>
-      acc + Math.max(0, Number(i.expected_amount) - Number(i.paid_amount)) + (Number(i.penalty_pending) || 0), 0)
+  const totalOutstanding = financialBreakdown.totalOutstanding
 
   // ── Total em Atraso — unpaid balance on installments past due date ─────────
-  const todayStr = todayISO()
-  const totalInArrears = installments
-    .filter((i: Installment) => i.status !== 'cancelled' && i.status !== 'paid' && i.due_date < todayStr)
-    .reduce((acc: number, i: Installment) =>
-      acc + Math.max(0, Number(i.expected_amount) - Number(i.paid_amount)) + (Number(i.penalty_pending) || 0), 0)
+  const totalInArrears = financialBreakdown.inArrears
 
   // ── Projeção de Lucro — total interest income expected ────────────────────
   // (Total Expected across all active installments) − (Original Principal Lent)
-  const profitProjection = Math.max(0, totalExpected - (loanPrincipal ?? 0))
+  const profitProjection = financialBreakdown.futureProfit
 
   const settlement: Settlement = useMemo(() => calcSettlement(installments, loanConfig), [installments, loanConfig])
-  const totalPenaltiesPaid = useMemo(
-    () => installments.reduce((s, i) => s + Number(i.penalty_paid || 0), 0),
-    [installments]
-  )
+  const totalPenaltiesPaid = useMemo(() => financialBreakdown.penaltiesCollected, [financialBreakdown])
   const canOwnerAct = memberRole === 'owner' || memberRole === 'manager'
 
   // Derive the currency symbol strictly from the loan's own ISO currency code
@@ -1049,8 +1235,35 @@ export function InstallmentsDrawer({
   }, [loanConfig.currency])
 
   const totalPenaltyPending = useMemo(() => {
-    return installments.reduce((acc, inst) => acc + (Number(inst.penalty_pending) || 0), 0)
-  }, [installments])
+    return financialBreakdown.penaltiesPending
+  }, [financialBreakdown])
+
+  const activeAgreement = useMemo(
+    () => agreements.find(agreement => agreement.status === 'active') ?? null,
+    [agreements],
+  )
+  const agreementsById = useMemo(
+    () => new Map(agreements.map(agreement => [agreement.id, agreement])),
+    [agreements],
+  )
+
+  const formatAgreementKind = (kind: LoanAgreement['kind']) => {
+    const translated = t(`loans.agreement_kind_${kind}`)
+    if (translated !== `loans.agreement_kind_${kind}`) return translated
+
+    switch (kind) {
+      case 'initial': return 'Initial'
+      case 'renegotiation': return 'Renegotiation'
+      case 'renewal': return 'Renewal'
+      case 'manual_restructure': return 'Manual restructure'
+      default: return kind
+    }
+  }
+
+  const tooltipText = (key: string, fallback: string) => {
+    const translated = t(key)
+    return translated === key ? fallback : translated
+  }
 
   return (
     <>
@@ -1119,6 +1332,62 @@ export function InstallmentsDrawer({
               <p className="font-bold text-amber-400 text-sm">{ccySymbol}{fmt(profitProjection)}</p>
             </div>
           </div>
+
+          {agreements.length > 0 && (
+            <div className="mt-4 rounded-xl border border-border bg-background/80 p-3">
+              <div className="flex items-center gap-2 mb-2">
+                <p className="text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">
+                  {t('loans.agreement_history_title') || 'Agreement history'}
+                </p>
+                <InfoTooltip text={tooltipText('loans.tooltips.drawer_agreement_history', 'Shows the original agreement plus renewals and restructures. The active agreement is the one that should drive the current outstanding balance.')} />
+              </div>
+
+              {activeAgreement && (
+                <div className="mb-3 rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-semibold text-foreground">
+                        {(t('loans.active_agreement_label') || 'Active agreement')} #{activeAgreement.agreement_number}
+                      </p>
+                      <p className="text-[11px] text-muted-foreground">
+                        {formatAgreementKind(activeAgreement.kind)} · {ccySymbol}{fmt(Number(activeAgreement.total_amount) || 0)}
+                      </p>
+                    </div>
+                    <span className="px-2 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider bg-emerald-500/15 text-emerald-500">
+                      {t('loans.status_active') || 'active'}
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
+                {agreements.map(agreement => (
+                  <div key={agreement.id} className="flex items-start justify-between gap-3 rounded-lg border border-border/60 px-3 py-2">
+                    <div>
+                      <p className="text-xs font-semibold text-foreground">
+                        #{agreement.agreement_number} · {formatAgreementKind(agreement.kind)}
+                      </p>
+                      <p className="text-[11px] text-muted-foreground">
+                        {ccySymbol}{fmt(Number(agreement.total_amount) || 0)}
+                        {agreement.first_due_date ? ` · ${formatDateGlobal(agreement.first_due_date, dateFormat)}` : ''}
+                      </p>
+                    </div>
+                    <span className={cn(
+                      'px-2 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider',
+                      agreement.status === 'active' && 'bg-emerald-500/15 text-emerald-500',
+                      agreement.status === 'superseded' && 'bg-slate-500/15 text-slate-400',
+                      agreement.status === 'closed' && 'bg-blue-500/15 text-blue-400',
+                      agreement.status === 'cancelled' && 'bg-rose-500/15 text-rose-400',
+                    )}>
+                      {t(`loans.agreement_status_${agreement.status}`) === `loans.agreement_status_${agreement.status}`
+                        ? agreement.status
+                        : t(`loans.agreement_status_${agreement.status}`)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
 
         {/* ── INSTALLMENT LIST ── */}
@@ -1130,13 +1399,28 @@ export function InstallmentsDrawer({
           ) : installments.length === 0 ? (
             <div className="text-center py-10 text-sm text-muted-foreground">{t('loans.no_installments') || 'No installments found.'}</div>
           ) : (
-            installments.map((inst) => {
+            installments.map((inst, idx) => {
               const isPaid = inst.status === 'paid'
               const isExpanded = expandedIds.has(inst.id)
               const isReceiving = receivingId === inst.id
+              const agreement = inst.agreement_id ? agreementsById.get(inst.agreement_id) : null
+              const previousInst = installments[idx - 1]
+              const previousAgreementId = previousInst?.agreement_id ?? null
+              const showAgreementHeader = agreement && agreement.id !== previousAgreementId
 
               return (
-                <div key={inst.id} className={cn(
+                <div key={inst.id}>
+                  {showAgreementHeader && (
+                    <div className="mb-2 mt-4 first:mt-0 flex items-center gap-2">
+                      <span className="px-2 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider bg-indigo-500/15 text-indigo-400">
+                        {(t('loans.agreement_label') || 'Agreement')} #{agreement.agreement_number}
+                      </span>
+                      <span className="text-[11px] text-muted-foreground">
+                        {formatAgreementKind(agreement.kind)}
+                      </span>
+                    </div>
+                  )}
+                <div className={cn(
                   'border rounded-xl transition-all overflow-hidden shadow-sm',
                   isPaid ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-border bg-card hover:border-slate-500/40',
                 )}>
@@ -1177,61 +1461,91 @@ export function InstallmentsDrawer({
                     <div className="border-t border-border/50">
 
                       {/* ── Admin Actions Toolbar ── */}
-                      {canOwnerAct && !isOffDuty && !isPaid && inst.status !== 'cancelled' && (
+                      {canOwnerAct && !isOffDuty && inst.status !== 'cancelled' && (
                         <div className="flex flex-wrap items-center gap-2 px-4 py-2.5 bg-muted/20 border-b border-border/30">
-                          <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider shrink-0">{t('loans.admin_actions') || 'Actions'}:</span>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">{t('loans.admin_actions') || 'Actions'}:</span>
+                            <InfoTooltip text={tooltipText('loans.tooltips.drawer_admin_actions', 'Operational actions to correct installments, move balances, waive debt or renew the agreement.')} />
+                          </div>
 
                           <button
-                            onClick={(e) => { e.stopPropagation(); void handleWaiveAndClose(inst) }}
-                            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-emerald-400 bg-emerald-400/10 hover:bg-emerald-400/20 border border-emerald-500/20 rounded-md transition-all active:scale-95"
+                            onClick={(e) => { e.stopPropagation(); startEdit(inst) }}
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-sky-400 bg-sky-400/10 hover:bg-sky-400/20 border border-sky-500/20 rounded-md transition-all active:scale-95"
                           >
-                            <CheckCircle2 className="w-3 h-3" />
-                            {t('loans.waive_close_btn')}
+                            <Pencil className="w-3 h-3" />
+                            {t('loans.edit_installment_btn') || 'Edit installment'}
+                            <InfoTooltip text={tooltipText('loans.tooltips.drawer_edit_installment', 'Adjust due date, expected amount or pending penalty for this installment.')} />
                           </button>
 
-                          <div className="relative">
+                          {isPaid && (
                             <button
-                              onClick={(e) => { e.stopPropagation(); setRolloverMenuId(rolloverMenuId === inst.id ? null : inst.id) }}
-                              className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-indigo-400 bg-indigo-400/10 hover:bg-indigo-400/20 border border-indigo-500/20 rounded-md transition-all active:scale-95"
+                              onClick={(e) => { e.stopPropagation(); void handleReopenInstallment(inst) }}
+                              className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-amber-400 bg-amber-400/10 hover:bg-amber-400/20 border border-amber-500/20 rounded-md transition-all active:scale-95"
                             >
-                              <RotateCcw className="w-3 h-3" />
-                              {t('loans.rollover_btn')}
-                              <ChevronDown className="h-3 w-3" />
+                              <RefreshCw className="w-3 h-3" />
+                              {t('loans.reopen_btn') || 'Reopen'}
+                              <InfoTooltip text={tooltipText('loans.tooltips.drawer_reopen_installment', 'Recalculate the installment status from its current payments and reopen it if it should not stay marked as paid.')} />
                             </button>
+                          )}
 
-                            {rolloverMenuId === inst.id && (
-                              <div className="absolute left-0 mt-1 w-52 bg-card border border-border rounded-lg shadow-xl z-20 py-1 overflow-hidden">
+                          {!isPaid && (
+                            <>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); void handleWaiveAndClose(inst) }}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-emerald-400 bg-emerald-400/10 hover:bg-emerald-400/20 border border-emerald-500/20 rounded-md transition-all active:scale-95"
+                              >
+                                <CheckCircle2 className="w-3 h-3" />
+                                {t('loans.waive_close_btn')}
+                                <InfoTooltip text={tooltipText('loans.tooltips.drawer_waive_close', 'Forgive the remaining principal and penalties on this installment without recording new cash received.')} />
+                              </button>
+
+                              <div className="relative">
                                 <button
-                                  onClick={(e) => { e.stopPropagation(); void handleRolloverToNext(inst); setRolloverMenuId(null) }}
-                                  className="w-full text-left px-4 py-2 text-xs hover:bg-muted text-foreground transition-colors"
+                                  onClick={(e) => { e.stopPropagation(); setRolloverMenuId(rolloverMenuId === inst.id ? null : inst.id) }}
+                                  className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-indigo-400 bg-indigo-400/10 hover:bg-indigo-400/20 border border-indigo-500/20 rounded-md transition-all active:scale-95"
                                 >
-                                  {t('loans.rollover_no_next') || 'Add to Next Instalment'}
+                                  <RotateCcw className="w-3 h-3" />
+                                  {t('loans.rollover_btn')}
+                                  <ChevronDown className="h-3 w-3" />
+                                  <InfoTooltip text={tooltipText('loans.tooltips.drawer_rollover', 'Move the unpaid balance to another installment or convert it into a renewal cycle.')} />
                                 </button>
-                                <button
-                                  onClick={(e) => { e.stopPropagation(); void handleRolloverToFinal(inst); setRolloverMenuId(null) }}
-                                  className="w-full text-left px-4 py-2 text-xs hover:bg-muted text-foreground transition-colors"
-                                >
-                                  {t('loans.rollover_to_final') || 'Add to Final Instalment'}
-                                </button>
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation()
-                                    setRolloverMenuId(null)
-                                    setRenewingInst(inst)
-                                    setRenewPaidToday('')
-                                    setRenewInterestRate(String(loanConfig.late_fee_daily_pct || 0))
-                                    const nextMonth = new Date()
-                                    nextMonth.setMonth(nextMonth.getMonth() + 1)
-                                    setRenewDueDate(nextMonth.toISOString().split('T')[0])
-                                    setShowRenewModal(true)
-                                  }}
-                                  className="w-full text-left px-4 py-2 text-xs font-medium hover:bg-muted text-violet-400 transition-colors"
-                                >
-                                  {t('loans.renew_rollover_btn') || 'Renew / Rollover'}
-                                </button>
+
+                                {rolloverMenuId === inst.id && (
+                                  <div className="absolute left-0 mt-1 w-52 bg-card border border-border rounded-lg shadow-xl z-20 py-1 overflow-hidden">
+                                    <button
+                                      onClick={(e) => { e.stopPropagation(); void handleRolloverToNext(inst); setRolloverMenuId(null) }}
+                                      className="w-full text-left px-4 py-2 text-xs hover:bg-muted text-foreground transition-colors"
+                                    >
+                                      {t('loans.rollover_no_next') || 'Add to Next Instalment'}
+                                    </button>
+                                    <button
+                                      onClick={(e) => { e.stopPropagation(); void handleRolloverToFinal(inst); setRolloverMenuId(null) }}
+                                      className="w-full text-left px-4 py-2 text-xs hover:bg-muted text-foreground transition-colors"
+                                    >
+                                      {t('loans.rollover_to_final') || 'Add to Final Instalment'}
+                                    </button>
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        setRolloverMenuId(null)
+                                        setRenewingInst(inst)
+                                        setRenewMode('capitalize_balance')
+                                        setRenewPaidToday('')
+                                        setRenewInterestRate(String(loanConfig.late_fee_daily_pct || 0))
+                                        const nextMonth = new Date()
+                                        nextMonth.setMonth(nextMonth.getMonth() + 1)
+                                        setRenewDueDate(nextMonth.toISOString().split('T')[0])
+                                        setShowRenewModal(true)
+                                      }}
+                                      className="w-full text-left px-4 py-2 text-xs font-medium hover:bg-muted text-violet-400 transition-colors"
+                                    >
+                                      {t('loans.renew_rollover_btn') || 'Renew / Rollover'}
+                                    </button>
+                                  </div>
+                                )}
                               </div>
-                            )}
-                          </div>
+                            </>
+                          )}
                         </div>
                       )}
 
@@ -1239,6 +1553,9 @@ export function InstallmentsDrawer({
                       {inst.payment_history?.length > 0 && (
                         <div className="px-4 pt-3 pb-2">
                           <p className="text-[10px] text-muted-foreground uppercase tracking-wider font-semibold mb-2">{t('loans.payment_history_label') || 'Payment History'}</p>
+                          <div className="mb-2">
+                            <InfoTooltip text={tooltipText('loans.tooltips.drawer_payment_history', 'Each entry represents a real payment or manual adjustment recorded on this installment. Edit entries to fix historical mistakes safely.')} />
+                          </div>
                           <div className="space-y-1.5">
                             {inst.payment_history.map((ph, idx) => (
                               <div key={idx} className="flex justify-between items-center text-xs px-3 py-2 bg-muted/30 border border-border/40 rounded-lg">
@@ -1257,18 +1574,116 @@ export function InstallmentsDrawer({
                                     )}
                                   </div>
                                   {canOwnerAct && !isOffDuty && (
-                                    <button
-                                      onClick={(e) => { e.stopPropagation(); void handleDeletePayment(inst, idx) }}
-                                      title={t('loans.delete_payment_btn')}
-                                      className="p-1 rounded hover:bg-rose-500/10 text-muted-foreground hover:text-rose-400 transition-colors"
-                                    >
-                                      <Trash2 className="w-3 h-3" />
-                                    </button>
+                                    <>
+                                      <button
+                                        onClick={(e) => { e.stopPropagation(); startHistoryEdit(inst, idx) }}
+                                        title={t('loans.edit_payment_btn') || 'Edit payment'}
+                                        className="p-1 rounded hover:bg-sky-500/10 text-muted-foreground hover:text-sky-400 transition-colors"
+                                      >
+                                        <Pencil className="w-3 h-3" />
+                                      </button>
+                                      <button
+                                        onClick={(e) => { e.stopPropagation(); void handleDeletePayment(inst, idx) }}
+                                        title={t('loans.delete_payment_btn')}
+                                        className="p-1 rounded hover:bg-rose-500/10 text-muted-foreground hover:text-rose-400 transition-colors"
+                                      >
+                                        <Trash2 className="w-3 h-3" />
+                                      </button>
+                                    </>
                                   )}
                                 </div>
                               </div>
                             ))}
                           </div>
+                        </div>
+                      )}
+
+                      {editingId === inst.id && (
+                        <div className="px-4 pb-3">
+                          {editingHistoryIdx !== null ? (
+                            <div className="rounded-xl border border-sky-500/20 bg-sky-500/5 p-3 space-y-3">
+                              <p className="text-[10px] font-semibold text-sky-400 uppercase tracking-wider">
+                                {t('loans.edit_payment_btn') || 'Edit payment'}
+                              </p>
+                              <div className="grid grid-cols-2 gap-3">
+                                <div>
+                                  <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1 block">Amount</label>
+                                  <input type="number" value={historyEditAmount} onChange={e => setHistoryEditAmount(e.target.value)} className="w-full rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40" />
+                                </div>
+                                <div>
+                                  <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1 block">Penalty</label>
+                                  <input type="number" value={historyEditPenalty} onChange={e => setHistoryEditPenalty(e.target.value)} className="w-full rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40" />
+                                </div>
+                                <div>
+                                  <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1 block">Date</label>
+                                  <input type="date" value={historyEditDate} onChange={e => setHistoryEditDate(e.target.value)} className="w-full rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40" />
+                                </div>
+                                <div>
+                                  <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1 block">Reason</label>
+                                  <input type="text" value={historyEditReason} onChange={e => setHistoryEditReason(e.target.value)} placeholder={t('loans.edit_reason_required') || 'Reason'} className="w-full rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40" />
+                                </div>
+                              </div>
+                              <div className="flex gap-2">
+                                <button onClick={() => { setEditingHistoryIdx(null); setHistoryEditReason('') }} className="flex-1 px-4 py-2 text-sm font-medium text-foreground bg-muted/50 hover:bg-muted border border-border rounded-lg transition-colors">
+                                  {t('loans.cancel_btn') || 'Cancel'}
+                                </button>
+                                <button onClick={() => void handleSaveHistoryEdit(inst, editingHistoryIdx)} disabled={savingEdit} className="flex-1 inline-flex items-center justify-center gap-2 bg-primary text-primary-foreground hover:bg-primary/90 font-semibold px-4 py-2 text-sm rounded-lg transition-colors disabled:opacity-50">
+                                  {savingEdit ? <Loader2 className="h-4 w-4 animate-spin" /> : (t('loans.save_btn') || 'Save')}
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="rounded-xl border border-sky-500/20 bg-sky-500/5 p-3 space-y-3">
+                              <p className="text-[10px] font-semibold text-sky-400 uppercase tracking-wider">
+                                {t('loans.edit_installment_btn') || 'Edit installment'}
+                              </p>
+                              <div className="grid grid-cols-2 gap-3">
+                                <div>
+                                  <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1 block">Due date</label>
+                                  <input type="date" value={editDueDate} onChange={e => setEditDueDate(e.target.value)} className="w-full rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40" />
+                                </div>
+                                <div>
+                                  <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1 block">Expected</label>
+                                  <input type="number" value={editExpected} onChange={e => setEditExpected(e.target.value)} className="w-full rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40" />
+                                </div>
+                                <div>
+                                  <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1 block">Pending penalty</label>
+                                  <input type="number" value={editPenaltyPending} onChange={e => setEditPenaltyPending(e.target.value)} className="w-full rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40" />
+                                </div>
+                                {(inst.status === 'paid' || inst.status === 'partial') && (inst.payment_history ?? []).length === 0 && (
+                                  <>
+                                    <div>
+                                      <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1 block">Paid amount</label>
+                                      <input type="number" value={editPaidAmount} onChange={e => setEditPaidAmount(e.target.value)} className="w-full rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40" />
+                                    </div>
+                                    <div>
+                                      <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1 block">Paid date</label>
+                                      <input type="date" value={editPaidAt} onChange={e => setEditPaidAt(e.target.value)} className="w-full rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40" />
+                                    </div>
+                                  </>
+                                )}
+                              </div>
+                              {(inst.status === 'paid' || inst.status === 'partial') && (inst.payment_history ?? []).length > 0 && (
+                                <p className="text-xs text-muted-foreground">
+                                  {t('loans.edit_history_instead') || 'For installments with payment history, edit the entries above to keep calculations consistent.'}
+                                </p>
+                              )}
+                              <div className="flex gap-2">
+                                <button onClick={() => { setEditingId(null); setEditingHistoryIdx(null) }} className="flex-1 px-4 py-2 text-sm font-medium text-foreground bg-muted/50 hover:bg-muted border border-border rounded-lg transition-colors">
+                                  {t('loans.cancel_btn') || 'Cancel'}
+                                </button>
+                                {(inst.status === 'paid' || inst.status === 'partial') && (inst.payment_history ?? []).length === 0 ? (
+                                  <button onClick={() => void handleSaveEditPayment(inst)} disabled={savingEdit} className="flex-1 inline-flex items-center justify-center gap-2 bg-primary text-primary-foreground hover:bg-primary/90 font-semibold px-4 py-2 text-sm rounded-lg transition-colors disabled:opacity-50">
+                                    {savingEdit ? <Loader2 className="h-4 w-4 animate-spin" /> : (t('loans.save_btn') || 'Save')}
+                                  </button>
+                                ) : (
+                                  <button onClick={() => void handleSaveEdit(inst)} disabled={savingEdit} className="flex-1 inline-flex items-center justify-center gap-2 bg-primary text-primary-foreground hover:bg-primary/90 font-semibold px-4 py-2 text-sm rounded-lg transition-colors disabled:opacity-50">
+                                    {savingEdit ? <Loader2 className="h-4 w-4 animate-spin" /> : (t('loans.save_btn') || 'Save')}
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          )}
                         </div>
                       )}
 
@@ -1300,6 +1715,7 @@ export function InstallmentsDrawer({
                                 e.stopPropagation()
                                 setRolloverMenuId(null)
                                 setRenewingInst(inst)
+                                setRenewMode('capitalize_balance')
                                 setRenewPaidToday('')
                                 setRenewInterestRate(String(loanConfig.late_fee_daily_pct || 0))
                                 const nextMonth = new Date()
@@ -1458,6 +1874,7 @@ export function InstallmentsDrawer({
                   )}
 
                 </div>
+                </div>
               )
             })
           )}
@@ -1481,11 +1898,14 @@ export function InstallmentsDrawer({
         const inst = renewingInst
         const paidToday = Math.max(0, parseFloat(renewPaidToday) || 0)
         const interestRate = Math.max(0, parseFloat(renewInterestRate) || 0)
-        const remaining = Math.max(0, Number(inst.expected_amount) - Number(inst.paid_amount))
+        const remaining = Math.max(0, Number(inst.expected_amount) - getEffectivePaidAmount(inst))
         const penaltyPending = Number(inst.penalty_pending) || 0
         const outstanding = remaining + penaltyPending
-        const remainingPrincipal = Math.max(0, outstanding - paidToday)
-        const newExpected = remainingPrincipal + remainingPrincipal * (interestRate / 100)
+        const remainingPrincipal = renewMode === 'interest_only'
+          ? Math.max(0, financialBreakdown.principalRemaining)
+          : Math.max(0, outstanding - paidToday)
+        const carriedPenaltyBase = penaltyPending
+        const newExpected = remainingPrincipal + carriedPenaltyBase + remainingPrincipal * (interestRate / 100)
         const isValid = !!renewDueDate && paidToday <= outstanding
 
         return (
@@ -1549,6 +1969,38 @@ export function InstallmentsDrawer({
                   )}
                 </div>
 
+                <div>
+                  <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">
+                    {t('loans.renew_mode_label') || 'Renewal mode'}
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      onClick={() => setRenewMode('capitalize_balance')}
+                      className={cn(
+                        'rounded-lg border px-3 py-2 text-left text-xs transition-colors',
+                        renewMode === 'capitalize_balance'
+                          ? 'border-primary bg-primary/10 text-foreground'
+                          : 'border-border bg-muted/20 text-muted-foreground hover:bg-muted/40',
+                      )}
+                    >
+                      <span className="block font-semibold">{t('loans.renew_mode_capitalize') || 'Capitalize balance'}</span>
+                      <span className="block mt-1 text-[11px]">{t('loans.renew_mode_capitalize_desc') || 'Today’s payment reduces the balance before the new cycle is created.'}</span>
+                    </button>
+                    <button
+                      onClick={() => setRenewMode('interest_only')}
+                      className={cn(
+                        'rounded-lg border px-3 py-2 text-left text-xs transition-colors',
+                        renewMode === 'interest_only'
+                          ? 'border-primary bg-primary/10 text-foreground'
+                          : 'border-border bg-muted/20 text-muted-foreground hover:bg-muted/40',
+                      )}
+                    >
+                      <span className="block font-semibold">{t('loans.renew_mode_interest_only') || 'Interest only'}</span>
+                      <span className="block mt-1 text-[11px]">{t('loans.renew_mode_interest_only_desc') || 'Keep the principal rolling and treat today’s payment as renewal income.'}</span>
+                    </button>
+                  </div>
+                </div>
+
                 {/* Input 2: New Due Date */}
                 <div>
                   <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider mb-1.5 block">
@@ -1588,6 +2040,12 @@ export function InstallmentsDrawer({
                       <span>{t('loans.renew_remaining_principal') || 'Remaining Principal'}</span>
                       <span className="font-semibold text-foreground">{ccySymbol}{fmt(remainingPrincipal)}</span>
                     </div>
+                    {carriedPenaltyBase > 0 && (
+                      <div className="flex justify-between text-muted-foreground">
+                        <span>{t('loans.renew_carried_penalty') || 'Carried penalty'}</span>
+                        <span className="font-semibold text-rose-400">{ccySymbol}{fmt(carriedPenaltyBase)}</span>
+                      </div>
+                    )}
                     {interestRate > 0 && (
                       <div className="flex justify-between text-muted-foreground">
                         <span>{t('loans.renew_interest_charge') || 'Interest'} ({interestRate}%)</span>

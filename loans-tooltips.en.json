@@ -1,0 +1,30 @@
+{
+  "loans": {
+    "tooltips": {
+      "analytics_total_lent": "Original principal disbursed across the loans in this view.",
+      "analytics_total_recovered": "Principal already recovered from borrower payments. Penalties are excluded.",
+      "analytics_total_outstanding": "Remaining active balance still owed, including pending penalties on active installments.",
+      "analytics_in_arrears": "Late balance already past due, including pending penalties on overdue installments.",
+      "analytics_penalties_pending": "Late fees calculated or carried on active installments that have not been paid or waived yet.",
+      "analytics_penalties_collected": "Late fees already collected from borrowers.",
+      "analytics_profit_projection": "Expected remaining profit if current active agreements are paid as scheduled.",
+      "analytics_total_profit": "Realized profit plus future projected profit for the active operation.",
+      "drawer_admin_actions": "Operational actions to correct installments, move balances, waive debt or renew the agreement.",
+      "drawer_edit_installment": "Adjust due date, expected amount or pending penalty for this installment.",
+      "drawer_reopen_installment": "Recalculate the installment status from its current payments and reopen it if it should not stay marked as paid.",
+      "drawer_waive_close": "Forgive the remaining principal and penalties on this installment without recording new cash received.",
+      "drawer_rollover": "Move the unpaid balance to another installment or convert it into a renewal cycle.",
+      "drawer_payment_history": "Each entry represents a real payment or manual adjustment recorded on this installment. Edit entries to fix historical mistakes safely.",
+      "drawer_agreement_history": "Shows the original agreement plus renewals and restructures. The active agreement is the one that should drive the current outstanding balance.",
+      "create_principal": "Amount of capital you are lending before interest, penalties or renewals.",
+      "create_interest_rate": "Interest rate applied to the loan schedule. In simple mode it applies once to the whole loan. In compound mode it follows the PMT formula.",
+      "create_installments": "Number of scheduled installments in the original agreement.",
+      "create_frequency": "How often each installment is due. This defines the spacing between due dates in the original contract.",
+      "create_start_date": "Reference date used to generate the first due date and the rest of the installment schedule.",
+      "renegotiate_date": "Date used to calculate the settlement base and any penalties before creating the new agreement.",
+      "renegotiate_forgive_penalties": "When enabled, pending penalties stay in history but do not enter the new agreement base.",
+      "renegotiate_installments_count": "Number of installments that will be created in the new agreement.",
+      "renegotiate_rate": "Flat percentage applied once to the settlement base in this restructuring flow."
+    }
+  }
+}
